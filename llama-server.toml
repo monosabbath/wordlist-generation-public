@@ -1,0 +1,9 @@
+base_url = "http://80.188.223.202:35567/v1"
+api_key = "770b242c4fd9c4c182bd1f4dc6c765709377d7e2e8023c9914b0a1dfd71db158"
+temperature = 0.9
+top_p = 0.8
+top_k = 20
+min_p = 0
+repetition_penalty = 1.5
+length_penalty = 3.0
+max_tokens = 200

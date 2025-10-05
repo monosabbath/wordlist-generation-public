@@ -48,15 +48,15 @@ def main(n_words, wordlist, server):
         response = client.chat.completions.create(
             model="",
             messages=messages,
-            temperature=0.7,
+            temperature=server["temperature"],
             extra_body={
                 "guided_grammar": grammar,
-                "top_p": 0.8,
-                "top_k": 20,
-                "min_p": 0,
-                "repetition_penalty": 1.5,
-                "length_penalty": 3.0,
-                "max_tokens": 200,
+                "top_p": server["top_p"],
+                "top_k": server["top_k"],
+                "min_p": server["min_p"],
+                "repetition_penalty": server["repetition_penalty"],
+                "length_penalty": server["length_penalty"],
+                "max_tokens": server["max_tokens"],
             },
         )
         assistant_message = response.choices[0].message.content
