@@ -5,7 +5,8 @@ import httpx
 
 from common import GenerateRequest
 
-url = "https://comic-boxes-phrase-successful.trycloudflare.com"
+qwen_url = "https://comic-boxes-phrase-successful.trycloudflare.com"
+gemma_url = "https://cigarette-charges-competitors-throws.trycloudflare.com"
 
 
 class Lang(StrEnum):
@@ -13,8 +14,13 @@ class Lang(StrEnum):
     ES = auto()
 
 
+class Model(StrEnum):
+    QWEN = auto()
+    GEMMA = auto()
+
+
 @click.command()
-@click.argument("prompt")
+@click.option("--model", type=click.Choice(Model, case_sensitive=False), default="qwen")
 @click.option("--lang", type=click.Choice(Lang, case_sensitive=False), default="en")
 @click.option("--n-words", default=5000)
 @click.option("--max-new-tokens", type=int)
@@ -22,27 +28,33 @@ class Lang(StrEnum):
 @click.option("--repetition-penalty", type=float)
 @click.option("--length-penalty", type=float)
 def main(
-    prompt, lang, n_words, max_new_tokens, num_beams, repetition_penalty, length_penalty
+    model, lang, n_words, max_new_tokens, num_beams, repetition_penalty, length_penalty
 ):
-    kwargs = dict(
-        prompt=prompt,
-        vocab_lang=lang,
-        vocab_n_words=n_words,
-        max_new_tokens=max_new_tokens,
-        num_beams=num_beams,
-        repetition_penalty=repetition_penalty,
-        length_penalty=length_penalty,
-    )
-    for k in list(kwargs):
-        if kwargs[k] is None:
-            del kwargs[k]
-    request = GenerateRequest(**kwargs)
-    r = httpx.post(
-        url + "/generate",
-        params={"token": "my-secret-token-structured-generation"},
-        json=request.model_dump(),
-    )
-    print(r.text)
+    if model == Model.QWEN:
+        url = qwen_url
+    else:
+        url = gemma_url
+    while True:
+        kwargs = dict(
+            prompt=input("prompt: "),
+            vocab_lang=lang,
+            vocab_n_words=n_words,
+            max_new_tokens=max_new_tokens,
+            num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            length_penalty=length_penalty,
+        )
+        for k in list(kwargs):
+            if kwargs[k] is None:
+                del kwargs[k]
+        request = GenerateRequest(**kwargs)
+        r = httpx.post(
+            url + "/generate",
+            params={"token": "my-secret-token-structured-generation"},
+            json=request.model_dump(),
+            timeout=60,
+        )
+        print("answer:", r.json())
 
 
 if __name__ == "__main__":
