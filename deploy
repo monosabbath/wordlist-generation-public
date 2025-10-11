@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+IFS=$'\n\t'
+
+FILENAME="repo-$(git rev-parse --short HEAD).tar.gz"
+git archive --format=tar.gz --output="$FILENAME" HEAD
+scp "$FILENAME" vast:/workspace/versions
+ssh vast -f "tar -xf \"/workspace/versions/$FILENAME\" -C /workspace/versions --one-top-level && rm \"/workspace/versions/$FILENAME\""
+rm "$FILENAME"
