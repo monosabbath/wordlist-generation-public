@@ -34,7 +34,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     )
     word_regexp = "(" + word_regexp + ")"
     punct_regexp = "[- ,.!?():;¿!]+"
-    parser = RegexParser(f"({word_regexp}|{punct_regexp})+")
+    parser = RegexParser(f"({word_regexp}{punct_regexp})+")
     prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     return prefix_fn
 
