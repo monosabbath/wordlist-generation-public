@@ -4,6 +4,7 @@ import uuid
 from functools import cache
 from typing import Literal, Optional
 
+from dotenv import load_dotenv
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
@@ -14,10 +15,19 @@ from pydantic import BaseModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
 )
 
+# Optional: only needed if you plan to use 8/4-bit quantization
+try:
+    from transformers import BitsAndBytesConfig  # noqa: F401
+    HAVE_BNB = True
+except Exception:
+    HAVE_BNB = False
+
 from common import GenerateRequest
+
+# Load .env as early as possible
+load_dotenv()
 
 app = FastAPI()
 
@@ -41,17 +51,20 @@ TORCH_DTYPE = _DTYPE_MAP.get(DTYPE_STR, torch.float32)
 
 LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
 LOAD_IN_4BIT = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
+if (LOAD_IN_8BIT or LOAD_IN_4BIT) and not HAVE_BNB:
+    raise RuntimeError(
+        "bitsandbytes not installed but LOAD_IN_8BIT/LOAD_IN_4BIT requested. "
+        "Install it or disable quantization."
+    )
 
 # Auth token
-SECRET_TOKEN = os.getenv(
-    "SECRET_TOKEN", "my-secret-token-structured-generation"
-)
+SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 
-# Default system prompt (can be empty string)
+# Default system prompts (can be empty strings)
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
 
-# Prebuild toggles
+# Prebuild toggles for constrained vocab
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
@@ -64,14 +77,17 @@ quant_config = None
 model_init_kwargs = {
     "device_map": DEVICE_MAP,
 }
+
 if LOAD_IN_8BIT or LOAD_IN_4BIT:
+    # Lazy import only when needed
+    from transformers import BitsAndBytesConfig
+
     quant_config = BitsAndBytesConfig(
         load_in_8bit=LOAD_IN_8BIT,
         load_in_4bit=LOAD_IN_4BIT,
         bnb_4bit_compute_dtype=torch.bfloat16 if TORCH_DTYPE == torch.bfloat16 else torch.float16,
     )
     model_init_kwargs["quantization_config"] = quant_config
-    # When quantized, do not force torch_dtype; let quantization drive precision
 else:
     model_init_kwargs["torch_dtype"] = TORCH_DTYPE
 
@@ -80,7 +96,6 @@ model = AutoModelForCausalLM.from_pretrained(
     **model_init_kwargs,
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
 
 # -----------------------
 # Regex-constrained vocab
@@ -116,7 +131,6 @@ if PREBUILD_PREFIX:
             build_regexp_prefix_fn(lang, n_words)
     print("done")
 
-
 # -----------------------
 # Auth helper
 # -----------------------
@@ -133,7 +147,6 @@ def verify_token(
     if SECRET_TOKEN and supplied != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
-
 
 # -----------------------
 # Legacy constrained API
@@ -171,9 +184,8 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     result = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
     return result
 
-
 # -----------------------
-# OpenAI-compatible API
+# OpenAI-compatible API (optional but useful)
 # -----------------------
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
@@ -181,7 +193,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionExtras(BaseModel):
-    # Optional, non-standard extras to enable constrained vocab on the OAI API:
+    # Optional extras to enable constrained vocab on the OAI API:
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
@@ -251,7 +263,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     )
 
     # Extras for constraints and penalties
-    prefix_fn = None
     if req.extra:
         if req.extra.vocab_lang and req.extra.vocab_n_words:
             prefix_fn = build_regexp_prefix_fn(req.extra.vocab_lang, req.extra.vocab_n_words)
