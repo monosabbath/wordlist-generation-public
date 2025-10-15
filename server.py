@@ -113,7 +113,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     word_regexp = "(" + word_regexp + ")"
 
     # 1. Update to include whitespace (including newlines) using \\s
-    punct_regexp = "[-.,!?():;¿!\\s]+"
+    punct_regexp = "[-.,!?():;¿!¡\\s]+"
 
     # 2. Update grammar to allow flexible interleaving and natural EOS
     # Grammar: (Word OR Punctuation)+
