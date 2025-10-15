@@ -14,6 +14,8 @@ dependencies = [
     "pydantic>=2.11.10",
     "torch>=2.8.0",
     "transformers>=4.57.0",
+    "python-dotenv>=1.0.1",
+    # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
     "bitsandbytes>=0.42.0",
 ]
 
