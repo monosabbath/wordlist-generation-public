@@ -192,15 +192,6 @@ class ChatMessage(BaseModel):
     content: str
 
 
-class ChatCompletionExtras(BaseModel):
-    # Optional extras to enable constrained vocab on the OAI API:
-    vocab_lang: Optional[Literal["en", "es"]] = None
-    vocab_n_words: Optional[int] = None
-    num_beams: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    length_penalty: Optional[float] = None
-
-
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -211,7 +202,13 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[list[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
-    extra: Optional[ChatCompletionExtras] = None
+    
+    # Move these from extra to direct parameters
+    vocab_lang: Optional[Literal["en", "es"]] = None
+    vocab_n_words: Optional[int] = None
+    num_beams: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    length_penalty: Optional[float] = None
 
 
 @app.get("/v1/models")
@@ -262,17 +259,16 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         top_p=req.top_p if req.top_p is not None else 1.0,
     )
 
-    # Extras for constraints and penalties
-    if req.extra:
-        if req.extra.vocab_lang and req.extra.vocab_n_words:
-            prefix_fn = build_regexp_prefix_fn(req.extra.vocab_lang, req.extra.vocab_n_words)
-            gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
-        if req.extra.num_beams:
-            gen_kwargs["num_beams"] = req.extra.num_beams
-        if req.extra.repetition_penalty:
-            gen_kwargs["repetition_penalty"] = req.extra.repetition_penalty
-        if req.extra.length_penalty:
-            gen_kwargs["length_penalty"] = req.extra.length_penalty
+    # Access parameters directly from req instead of req.extra
+    if req.vocab_lang and req.vocab_n_words:
+        prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
+        gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+    if req.num_beams:
+        gen_kwargs["num_beams"] = req.num_beams
+    if req.repetition_penalty:
+        gen_kwargs["repetition_penalty"] = req.repetition_penalty
+    if req.length_penalty:
+        gen_kwargs["length_penalty"] = req.length_penalty
 
     outputs = model.generate(**inputs, **gen_kwargs)
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
