@@ -126,7 +126,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
 
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
-    for lang in ("en", "es"):
+    for lang in ("es",):
         for n_words in PREBUILD_WORD_COUNTS:
             build_regexp_prefix_fn(lang, n_words)
     print("done")
