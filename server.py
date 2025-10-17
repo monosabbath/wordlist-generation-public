@@ -116,8 +116,8 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     punct_regexp = "[-.,!?():;¿!¡\\s]+"
 
     # 2. Update grammar to allow flexible interleaving and natural EOS
-    # Grammar: (Word OR Punctuation)+
-    flexible_grammar = f"({word_regexp}|{punct_regexp})+"
+    # Grammar: (Word and Punctuation)+
+    flexible_grammar = f"({word_regexp}{punct_regexp})+"
     parser = RegexParser(flexible_grammar)
 
     prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
