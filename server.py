@@ -1,11 +1,12 @@
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from functools import cache
 from typing import Literal, Optional
 
-from dotenv import load_dotenv
 import torch
+from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
@@ -17,6 +18,8 @@ from transformers import (
     AutoTokenizer,
 )
 
+from common import GenerateRequest
+
 # Optional: only needed if you plan to use 8/4-bit quantization
 try:
     from transformers import BitsAndBytesConfig  # noqa: F401
@@ -24,12 +27,8 @@ try:
 except Exception:
     HAVE_BNB = False
 
-from common import GenerateRequest
-
 # Load .env as early as possible
 load_dotenv()
-
-app = FastAPI()
 
 # -----------------------
 # Config via environment
@@ -70,38 +69,71 @@ PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
 
-# -----------------------
-# Model / tokenizer load
-# -----------------------
-quant_config = None
-model_init_kwargs = {
-    "device_map": DEVICE_MAP,
-}
+# ----------------------------------------------------
+# Lifespan Manager for Startup and Shutdown Events
+# ----------------------------------------------------
 
-if LOAD_IN_8BIT or LOAD_IN_4BIT:
-    # Lazy import only when needed
-    from transformers import BitsAndBytesConfig
+# Create a dictionary to hold the model and tokenizer
+ml_models = {}
 
-    quant_config = BitsAndBytesConfig(
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT,
-        bnb_4bit_compute_dtype=torch.bfloat16 if TORCH_DTYPE == torch.bfloat16 else torch.float16,
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- Code to run on startup ---
+    print("INFO:     Application startup...")
+    
+    quant_config = None
+    model_init_kwargs = {
+        "device_map": DEVICE_MAP,
+    }
+
+    if LOAD_IN_8BIT or LOAD_IN_4BIT:
+        # Lazy import only when needed
+        from transformers import BitsAndBytesConfig
+
+        quant_config = BitsAndBytesConfig(
+            load_in_8bit=LOAD_IN_8BIT,
+            load_in_4bit=LOAD_IN_4BIT,
+            bnb_4bit_compute_dtype=torch.bfloat16 if TORCH_DTYPE == torch.bfloat16 else torch.float16,
+        )
+        model_init_kwargs["quantization_config"] = quant_config
+    else:
+        # The 'torch_dtype' argument is deprecated and will be removed in a future version of Transformers.
+        # It is recommended to use the 'dtype' argument instead.
+        model_init_kwargs["dtype"] = TORCH_DTYPE
+
+    # Load the model and tokenizer into the ml_models dictionary
+    ml_models["model"] = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        **model_init_kwargs,
     )
-    model_init_kwargs["quantization_config"] = quant_config
-else:
-    model_init_kwargs["torch_dtype"] = TORCH_DTYPE
+    ml_models["tokenizer"] = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    **model_init_kwargs,
-)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    if PREBUILD_PREFIX:
+        print("prebuilding prefix functions...")
+        for lang in ("es",):
+            for n_words in PREBUILD_WORD_COUNTS:
+                build_regexp_prefix_fn(lang, n_words, ml_models["tokenizer"])
+        print("done")
+    
+    print("INFO:     Application startup complete.")
+    
+    # Let the application run
+    yield
+    
+    # --- Code to run on shutdown ---
+    print("INFO:     Application shutdown...")
+    ml_models.clear()
+
+
+# Initialize FastAPI app with the lifespan manager
+app = FastAPI(lifespan=lifespan)
 
 # -----------------------
 # Regex-constrained vocab
 # -----------------------
 @cache
-def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
+def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int, tokenizer):
+    """Builds the prefix function for regex-constrained generation."""
     print(f"building prefix function for {lang} ({n_words} words)")
     with open(lang + ".txt") as fin:
         words = [word.strip().lower() for word in fin]
@@ -111,25 +143,12 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         "[" + w[0].lower() + w[0].upper() + "]" + w[1:] for w in words if w
     )
     word_regexp = "(" + word_regexp + ")"
-
-    # 1. Update to include whitespace (including newlines) using \\s
     punct_regexp = "[-.,!?():;¿!¡\\s]+"
-
-    # 2. Update grammar to allow flexible interleaving and natural EOS
-    # Grammar: (Word OR Punctuation)+
     flexible_grammar = f"({word_regexp}|{punct_regexp})+"
     parser = RegexParser(flexible_grammar)
 
     prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     return prefix_fn
-
-
-if PREBUILD_PREFIX:
-    print("prebuilding prefix functions...")
-    for lang in ("es",):
-        for n_words in PREBUILD_WORD_COUNTS:
-            build_regexp_prefix_fn(lang, n_words)
-    print("done")
 
 # -----------------------
 # Auth helper
@@ -138,9 +157,9 @@ def verify_token(
     token: Optional[str] = Query(default=None),
     authorization: Optional[str] = Header(default=None),
 ):
+    """Verifies the authentication token."""
     supplied = token
     if not supplied and authorization:
-        # Expect "Bearer <token>"
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             supplied = parts[1]
@@ -153,6 +172,10 @@ def verify_token(
 # -----------------------
 @app.post("/generate")
 def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) -> str:
+    """Generates text using the legacy API format."""
+    model = ml_models["model"]
+    tokenizer = ml_models["tokenizer"]
+
     system_msg = (
         DEFAULT_SYSTEM_PROMPT_ES
         if request.vocab_lang == "es"
@@ -160,7 +183,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     )
 
     messages = []
-    if system_msg != "":
+    if system_msg:
         messages.append({"role": "system", "content": system_msg})
     messages.append({"role": "user", "content": request.prompt})
 
@@ -169,7 +192,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     )
     input_ids = tokenizer(texts, return_tensors="pt").to(model.device)
     input_len = input_ids["input_ids"].shape[1]
-    prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
+    prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words, tokenizer)
 
     generated_ids = model.generate(
         **input_ids,
@@ -185,12 +208,11 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     return result
 
 # -----------------------
-# OpenAI-compatible API (optional but useful)
+# OpenAI-compatible API
 # -----------------------
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -203,16 +225,16 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     
-    # Move these from extra to direct parameters
+    # Custom parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
     repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = None
 
-
 @app.get("/v1/models")
 def list_models(auth_ok: bool = Depends(verify_token)):
+    """Lists the available models."""
     return {
         "object": "list",
         "data": [
@@ -224,20 +246,20 @@ def list_models(auth_ok: bool = Depends(verify_token)):
         ],
     }
 
-
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
-    # Merge system prompt(s)
+    """Handles chat completion requests in an OpenAI-compatible format."""
+    model = ml_models["model"]
+    tokenizer = ml_models["tokenizer"]
+    
     system_prompt = DEFAULT_SYSTEM_PROMPT_EN
-    # If any system message provided by client, prefer the first
     for msg in req.messages:
         if msg.role == "system":
             system_prompt = msg.content
             break
 
-    # Build messages for the model
     messages = []
-    if system_prompt != "":
+    if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     for msg in req.messages:
         if msg.role != "system":
@@ -259,9 +281,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         top_p=req.top_p if req.top_p is not None else 1.0,
     )
 
-    # Access parameters directly from req instead of req.extra
     if req.vocab_lang and req.vocab_n_words:
-        prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
+        prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words, tokenizer)
         gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
     if req.num_beams:
         gen_kwargs["num_beams"] = req.num_beams
@@ -273,7 +294,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     outputs = model.generate(**inputs, **gen_kwargs)
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
-    # Token usage accounting (approx)
+    # Token usage accounting
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = int(outputs[0].shape[0] - input_len)
     created = int(time.time())
