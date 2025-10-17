@@ -1,12 +1,8 @@
 import os
 import time
 import uuid
-import subprocess  # Added for running Tailscale commands
-import shutil  # Added for checking if tailscale is installed
-from contextlib import asynccontextmanager  # Added for lifespan
 from functools import cache
 from typing import Literal, Optional
-
 from dotenv import load_dotenv
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
@@ -32,102 +28,7 @@ from common import GenerateRequest
 # Load .env as early as possible
 load_dotenv()
 
-
-# -----------------------
-# Tailscale Lifespan
-# -----------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Handles application startup and shutdown events.
-    Installs Tailscale if not present, connects on startup, and disconnects on shutdown.
-    """
-    
-    # --- Installation Check ---
-    print("Checking if Tailscale is installed...")
-    if shutil.which("tailscale") is None:
-        print("Tailscale not found. Attempting to install...")
-        try:
-            # Run the installer script
-            # Using shell=True is necessary for the pipe (|)
-            install_command = "curl -fsSL https://tailscale.com/install.sh | sh"
-            subprocess.run(
-                install_command,
-                shell=True,
-                check=True,
-                capture_output=True,
-                text=True
-            )
-            print("✅ Tailscale installed successfully.")
-        except subprocess.CalledProcessError as e:
-            print("🚨 ERROR: Failed to install Tailscale.")
-            print(f"Installer script failed with error: {e.stderr}")
-            print("This may be a permissions issue. Please try installing manually:")
-            print("curl -fsSL https://tailscale.com/install.sh | sh")
-            print("Skipping Tailscale connection.")
-            yield  # Let the app run, but without Tailscale
-            return  # Exit after yield
-        except Exception as e:
-            print(f"🚨 ERROR: An unexpected error occurred during installation: {e}")
-            yield
-            return
-    else:
-        print("Tailscale is already installed.")
-
-
-    # --- Startup Connection ---
-    print("Attempting to connect to Tailscale...")
-    # Read auth key from environment
-    auth_key = os.getenv("TAILSCALE_AUTH_KEY")
-
-    if auth_key:
-        try:
-            # Run 'tailscale up'
-            command = [
-                "tailscale",
-                "up",
-                "--authkey",
-                auth_key,
-                "--accept-routes", # Good practice for client nodes
-            ]
-            subprocess.run(
-                command, check=True, capture_output=True, text=True
-            )
-            print("✅ Successfully connected to Tailscale.")
-
-            # Get and print the Tailscale IP address
-            ip_command = ["tailscale", "ip", "-4"]
-            ip_result = subprocess.run(
-                ip_command, check=True, capture_output=True, text=True
-            )
-            print(f"Tailscale IP: {ip_result.stdout.strip()}")
-            print(f"API will be available at: http://{ip_result.stdout.strip()}:8001")
-
-        except FileNotFoundError:
-            # This shouldn't happen now, but good to keep
-            print("🚨 ERROR: 'tailscale' command not found. Skipping connection.")
-        except subprocess.CalledProcessError as e:
-            print(f"🚨 ERROR: Failed to connect to Tailscale: {e.stderr}")
-        except Exception as e:
-            print(f"🚨 ERROR: An unexpected error occurred during Tailscale setup: {e}")
-    else:
-        print("⚠️ WARNING: TAILSCALE_AUTH_KEY not set. Skipping Tailscale connection.")
-
-    # Application is now running
-    yield
-
-    # --- Shutdown ---
-    print("Shutting down Tailscale connection...")
-    try:
-        # Run 'tailscale down'
-        subprocess.run(["tailscale", "down"], check=False, capture_output=True)
-        print("Tailscale disconnected.")
-    except Exception as e:
-        print(f"Error disconnecting Tailscale: {e}")
-
-
-# Pass the lifespan manager to the FastAPI app
-app = FastAPI(lifespan=lifespan)
+app = FastAPI()
 
 # -----------------------
 # Config via environment
@@ -303,7 +204,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     if stop_ids:
         gen_kwargs["eos_token_id"] = stop_ids
         # Use a valid pad token to silence warnings; reuse a stop token if no pad is defined
-        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id or stop_ids[0]
+        gen_kwargs["pad_token_id"] = stop_ids[0]
 
     generated_ids = model.generate(
         **input_ids,
@@ -401,7 +302,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     stop_ids = get_stop_ids(tokenizer)
     if stop_ids:
         gen_kwargs["eos_token_id"] = stop_ids
-        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id or stop_ids[0]
+        gen_kwargs["pad_token_id"] = stop_ids[0]
 
     outputs = model.generate(**inputs, **gen_kwargs)
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
@@ -430,12 +331,3 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         },
     }
     return resp
-
-# -----------------------
-# Uvicorn Runner
-# -----------------------
-if __name__ == "__main__":
-    import uvicorn
-    # Run the app on port 8001, accessible from any IP (0.0.0.0)
-    print("Starting Uvicorn server on http://0.0.0.0:8001")
-    uvicorn.run(app, host="0.0.0.0", port=8001)
