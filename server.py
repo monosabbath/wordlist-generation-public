@@ -143,7 +143,6 @@ quant_config = None
 model_init_kwargs = {
     "device_map": DEVICE_MAP,
 }
-
 if LOAD_IN_8BIT or LOAD_IN_4BIT:
     # Lazy import only when needed
     from transformers import BitsAndBytesConfig
@@ -164,6 +163,23 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
 # -----------------------
+# Helpers for stop tokens (EOS and Gemma <end_of_turn>)
+# -----------------------
+def get_stop_ids(tok: AutoTokenizer) -> list[int]:
+    stop_ids: list[int] = []
+    if tok.eos_token_id is not None:
+        stop_ids.append(tok.eos_token_id)
+    # Try both forms used in docs/tooling
+    for special in ("<end_of_turn>", "<end_of_turn>\n"):
+        try:
+            eid = tok.convert_tokens_to_ids(special)
+            if eid is not None and eid != tok.unk_token_id and eid not in stop_ids:
+                stop_ids.append(eid)
+        except Exception:
+            pass
+    return stop_ids
+
+# -----------------------
 # Regex-constrained vocab
 # -----------------------
 @cache
@@ -177,18 +193,22 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         "[" + w[0].lower() + w[0].upper() + "]" + w[1:] for w in words if w
     )
     word_regexp = "(" + word_regexp + ")"
-
-    # 1. Update to include whitespace (including newlines) using \\s
+    # Allow punctuation/whitespace (including newlines)
     punct_regexp = "[-.,!?():;¿!¡\\s]+"
-
-    # 2. Update grammar to allow flexible interleaving and natural EOS
-    # Grammar: (Word and Punctuation)+
+    # Keep your original grammar unchanged
     flexible_grammar = f"({word_regexp}{punct_regexp})+"
+
     parser = RegexParser(flexible_grammar)
+    base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
-    prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-    return prefix_fn
+    # Always allow EOS and Gemma's end-of-turn tokens in addition to regex-allowed tokens
+    stop_ids = set(get_stop_ids(tokenizer))
 
+    def wrapped_prefix_fn(batch_id, input_ids):
+        allowed = set(base_prefix_fn(batch_id, input_ids))
+        return list(allowed | stop_ids)
+
+    return wrapped_prefix_fn
 
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
@@ -224,7 +244,6 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         if request.vocab_lang == "es"
         else DEFAULT_SYSTEM_PROMPT_EN
     )
-
     messages = []
     if system_msg != "":
         messages.append({"role": "system", "content": system_msg})
@@ -235,10 +254,12 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     )
     input_ids = tokenizer(texts, return_tensors="pt").to(model.device)
     input_len = input_ids["input_ids"].shape[1]
+
     prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
 
-    generated_ids = model.generate(
-        **input_ids,
+    # Ensure generation can stop on EOS or Gemma end-of-turn
+    stop_ids = get_stop_ids(tokenizer)
+    gen_kwargs = dict(
         max_new_tokens=request.max_new_tokens,
         prefix_allowed_tokens_fn=prefix_fn,
         num_beams=request.num_beams,
@@ -246,6 +267,15 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         temperature=1.0,
         repetition_penalty=request.repetition_penalty,
         length_penalty=request.length_penalty,
+    )
+    if stop_ids:
+        gen_kwargs["eos_token_id"] = stop_ids
+        # Use a valid pad token to silence warnings; reuse a stop token if no pad is defined
+        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id or stop_ids[0]
+
+    generated_ids = model.generate(
+        **input_ids,
+        **gen_kwargs,
     )
     result = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
     return result
@@ -257,7 +287,6 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
 
-
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
@@ -268,14 +297,12 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[list[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
-
     # Move these from extra to direct parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
     repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = None
-
 
 @app.get("/v1/models")
 def list_models(auth_ok: bool = Depends(verify_token)):
@@ -289,7 +316,6 @@ def list_models(auth_ok: bool = Depends(verify_token)):
             }
         ],
     }
-
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
@@ -318,6 +344,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     # Generation params
     max_new_tokens = req.max_tokens if req.max_tokens is not None else 100
     do_sample = (req.temperature is None) or (req.temperature > 0)
+
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
@@ -325,16 +352,24 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         top_p=req.top_p if req.top_p is not None else 1.0,
     )
 
-    # Access parameters directly from req instead of req.extra
+    # Constrained vocab (optional)
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
         gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+
+    # Beam/search penalties
     if req.num_beams:
         gen_kwargs["num_beams"] = req.num_beams
     if req.repetition_penalty:
         gen_kwargs["repetition_penalty"] = req.repetition_penalty
     if req.length_penalty:
         gen_kwargs["length_penalty"] = req.length_penalty
+
+    # Ensure generation can stop on EOS or Gemma end-of-turn
+    stop_ids = get_stop_ids(tokenizer)
+    if stop_ids:
+        gen_kwargs["eos_token_id"] = stop_ids
+        gen_kwargs["pad_token_id"] = tokenizer.pad_token_id or stop_ids[0]
 
     outputs = model.generate(**inputs, **gen_kwargs)
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
@@ -343,6 +378,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = int(outputs[0].shape[0] - input_len)
     created = int(time.time())
+
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -362,7 +398,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         },
     }
     return resp
-
 
 # -----------------------
 # Uvicorn Runner
