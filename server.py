@@ -2,6 +2,7 @@ import os
 import time
 import uuid
 import subprocess  # Added for running Tailscale commands
+import shutil  # Added for checking if tailscale is installed
 from contextlib import asynccontextmanager  # Added for lifespan
 from functools import cache
 from typing import Literal, Optional
@@ -39,9 +40,42 @@ load_dotenv()
 async def lifespan(app: FastAPI):
     """
     Handles application startup and shutdown events.
-    Connects to Tailscale on startup and disconnects on shutdown.
+    Installs Tailscale if not present, connects on startup, and disconnects on shutdown.
     """
-    # --- Startup ---
+    
+    # --- Installation Check ---
+    print("Checking if Tailscale is installed...")
+    if shutil.which("tailscale") is None:
+        print("Tailscale not found. Attempting to install...")
+        try:
+            # Run the installer script
+            # Using shell=True is necessary for the pipe (|)
+            install_command = "curl -fsSL https://tailscale.com/install.sh | sh"
+            subprocess.run(
+                install_command,
+                shell=True,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            print("✅ Tailscale installed successfully.")
+        except subprocess.CalledProcessError as e:
+            print("🚨 ERROR: Failed to install Tailscale.")
+            print(f"Installer script failed with error: {e.stderr}")
+            print("This may be a permissions issue. Please try installing manually:")
+            print("curl -fsSL https://tailscale.com/install.sh | sh")
+            print("Skipping Tailscale connection.")
+            yield  # Let the app run, but without Tailscale
+            return  # Exit after yield
+        except Exception as e:
+            print(f"🚨 ERROR: An unexpected error occurred during installation: {e}")
+            yield
+            return
+    else:
+        print("Tailscale is already installed.")
+
+
+    # --- Startup Connection ---
     print("Attempting to connect to Tailscale...")
     # Read auth key from environment
     auth_key = os.getenv("TAILSCALE_AUTH_KEY")
@@ -49,7 +83,6 @@ async def lifespan(app: FastAPI):
     if auth_key:
         try:
             # Run 'tailscale up'
-            # Assumes script is run as root or user has perms (common in containers)
             command = [
                 "tailscale",
                 "up",
@@ -57,7 +90,6 @@ async def lifespan(app: FastAPI):
                 auth_key,
                 "--accept-routes", # Good practice for client nodes
             ]
-            # Using check=True to raise an error if the command fails
             subprocess.run(
                 command, check=True, capture_output=True, text=True
             )
@@ -72,8 +104,8 @@ async def lifespan(app: FastAPI):
             print(f"API will be available at: http://{ip_result.stdout.strip()}:8001")
 
         except FileNotFoundError:
+            # This shouldn't happen now, but good to keep
             print("🚨 ERROR: 'tailscale' command not found. Skipping connection.")
-            print("Please ensure Tailscale is installed in the instance.")
         except subprocess.CalledProcessError as e:
             print(f"🚨 ERROR: Failed to connect to Tailscale: {e.stderr}")
         except Exception as e:
