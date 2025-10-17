@@ -120,7 +120,7 @@ def get_cached_regex_parser(lang: Literal["en", "es"], n_words: int) -> Optional
     punct_regexp = "[-.,!?():;¿!¡\\s]+"
 
     # Grammar: (Word OR Punctuation)+
-    flexible_grammar = f"({word_regexp}|{punct_regexp})+"
+    flexible_grammar = f"({word_regexp}{punct_regexp})+"
     parser = RegexParser(flexible_grammar)
 
     return parser
