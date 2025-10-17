@@ -1,8 +1,9 @@
 import os
 import time
 import uuid
+import asyncio  # Import asyncio
 from functools import cache
-from typing import Literal, Optional
+from typing import Literal, Optional, List  # Ensure List is imported
 
 from dotenv import load_dotenv
 # Removed torch and transformers model/quantization imports
@@ -22,7 +23,20 @@ from pydantic import BaseModel
 from transformers import AutoTokenizer
 
 # Assuming common.py contains GenerateRequest definition
-from common import GenerateRequest
+# We add a try-except block to make the script runnable even if common.py is missing.
+try:
+    from common import GenerateRequest
+except ImportError:
+    print("Warning: common.GenerateRequest not found. Using placeholder definition.")
+    class GenerateRequest(BaseModel):
+        prompt: str
+        max_new_tokens: int = 100
+        repetition_penalty: Optional[float] = 1.0
+        length_penalty: Optional[float] = 1.0
+        num_beams: Optional[int] = 1
+        vocab_lang: Optional[Literal["en", "es"]] = None
+        vocab_n_words: Optional[int] = None
+
 
 # Load .env as early as possible
 load_dotenv()
@@ -95,7 +109,7 @@ def get_cached_regex_parser(lang: Literal["en", "es"], n_words: int) -> Optional
     except FileNotFoundError:
          print(f"Warning: Dictionary file {lang}.txt not found.")
          return None
-         
+        
     words = words[:n_words]
     # Case-insensitive first char
     word_regexp = "|".join(
@@ -136,7 +150,39 @@ def verify_token(
     return True
 
 # -----------------------
-# Inference Helpers (NEW)
+# Pydantic Models
+# -----------------------
+
+class ChatMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage]
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = 1.0
+    top_p: Optional[float] = 1.0
+    n: Optional[int] = 1
+    stop: Optional[list[str] | str] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    
+    # Custom parameters
+    vocab_lang: Optional[Literal["en", "es"]] = None
+    vocab_n_words: Optional[int] = None
+    num_beams: Optional[int] = None
+    repetition_penalty: Optional[float] = None
+    length_penalty: Optional[float] = None
+
+# NEW: Model for Explicit Batching
+class BatchGenerateRequest(BaseModel):
+    """Accepts a list of individual generation requests to be processed concurrently."""
+    requests: List[GenerateRequest]
+
+
+# -----------------------
+# Inference Helpers
 # -----------------------
 
 def _create_sampling_params(request) -> SamplingParams:
@@ -236,7 +282,6 @@ async def run_inference(prompt_text: str, sampling_params: SamplingParams) -> Re
 # -----------------------
 # Legacy constrained API
 # -----------------------
-# Changed to async def
 @app.post("/generate")
 async def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) -> str:
     system_msg = (
@@ -266,31 +311,82 @@ async def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_toke
     return ""
 
 # -----------------------
+# Explicit Batch API (NEW)
+# -----------------------
+
+@app.post("/generate_batch")
+async def generate_batch(batch_request: BatchGenerateRequest, auth_ok: bool = Depends(verify_token)):
+    """
+    Processes an explicit batch of generation requests concurrently within a single HTTP request.
+    """
+    tasks = []
+
+    # Helper function to create a placeholder task that immediately fails.
+    # This is used to maintain the correct order in the results if preparation fails for a specific item.
+    async def _create_failing_task(error_msg: str):
+        raise Exception(error_msg)
+
+    # 1. Preparation Phase
+    # Iterate through all requests and prepare the corresponding async tasks.
+    for i, request in enumerate(batch_request.requests):
+        try:
+            # 1a. Prepare Prompt (logic mirrored from the /generate endpoint)
+            system_msg = (
+                DEFAULT_SYSTEM_PROMPT_ES
+                if request.vocab_lang == "es"
+                else DEFAULT_SYSTEM_PROMPT_EN
+            )
+
+            messages = []
+            if system_msg != "":
+                messages.append({"role": "system", "content": system_msg})
+            messages.append({"role": "user", "content": request.prompt})
+
+            # Apply chat template
+            prompt_text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+
+            # 1b. Prepare SamplingParams
+            # CRUCIAL: Must be called inside the loop.
+            # This ensures a fresh, stateful logits_processor is created by lm-format-enforcer
+            # for this specific request via the _create_sampling_params helper.
+            sampling_params = _create_sampling_params(request)
+
+            # 1c. Create the async task using the existing helper
+            tasks.append(run_inference(prompt_text, sampling_params))
+
+        except Exception as e:
+            # Handle errors during preparation (e.g., bad sampling params raised by _create_sampling_params)
+            error_detail = str(e.detail) if isinstance(e, HTTPException) else str(e)
+            print(f"Error preparing request index {i}: {error_detail}")
+            # Add the placeholder failing task
+            tasks.append(_create_failing_task(f"Preparation Error: {error_detail}"))
+
+    # 2. Execution Phase
+    # Run all tasks concurrently. The AsyncLLM engine automatically optimizes the batching of these concurrent submissions.
+    # return_exceptions=True ensures the whole batch doesn't fail if one item fails during inference or preparation.
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 3. Response Formatting Phase (results maintain the order of the input tasks)
+    outputs = []
+    for final_output in results:
+        if isinstance(final_output, Exception):
+            # Handle inference or preparation failures
+            outputs.append({"success": False, "error": str(final_output), "text": None})
+        elif isinstance(final_output, RequestOutput) and final_output.outputs:
+            # Handle success
+            outputs.append({"success": True, "error": None, "text": final_output.outputs[0].text})
+        else:
+            # Handle cases where generation succeeded but produced no output
+            outputs.append({"success": True, "error": "Generation produced no output.", "text": ""})
+
+    return {"results": outputs}
+
+
+# -----------------------
 # OpenAI-compatible API
 # -----------------------
-class ChatMessage(BaseModel):
-    role: Literal["system", "user", "assistant"]
-    content: str
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
-    max_tokens: Optional[int] = None
-    temperature: Optional[float] = 1.0
-    top_p: Optional[float] = 1.0
-    n: Optional[int] = 1
-    stop: Optional[list[str] | str] = None
-    presence_penalty: Optional[float] = None
-    frequency_penalty: Optional[float] = None
-    
-    # Custom parameters
-    vocab_lang: Optional[Literal["en", "es"]] = None
-    vocab_n_words: Optional[int] = None
-    num_beams: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    length_penalty: Optional[float] = None
-
 
 @app.get("/v1/models")
 def list_models(auth_ok: bool = Depends(verify_token)):
@@ -305,7 +401,6 @@ def list_models(auth_ok: bool = Depends(verify_token)):
         ],
     }
 
-# Changed to async def
 @app.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
     start_time = time.time()
