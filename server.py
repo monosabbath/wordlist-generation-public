@@ -5,25 +5,23 @@ from functools import cache
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-import torch
+# Removed torch and transformers model/quantization imports
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
-from lmformatenforcer.integrations.transformers import (
-    build_transformers_prefix_allowed_tokens_fn,
+
+# Import vLLM Async Engine, SamplingParams, and integrations
+from vllm import AsyncLLM, SamplingParams
+from vllm.outputs import RequestOutput
+from lmformatenforcer.integrations.vllm import (
+    build_vllm_logits_processor,
+    build_vllm_token_enforcer_tokenizer_data,
 )
 from pydantic import BaseModel
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-)
 
-# Optional: only needed if you plan to use 8/4-bit quantization
-try:
-    from transformers import BitsAndBytesConfig  # noqa: F401
-    HAVE_BNB = True
-except Exception:
-    HAVE_BNB = False
+# We retain AutoTokenizer to ensure chat templates are applied correctly
+from transformers import AutoTokenizer
 
+# Assuming common.py contains GenerateRequest definition
 from common import GenerateRequest
 
 # Load .env as early as possible
@@ -35,76 +33,69 @@ app = FastAPI()
 # Config via environment
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")
 
-# Quantization / dtype
-DTYPE_STR = os.getenv("TORCH_DTYPE", "float32").lower()
-_DTYPE_MAP = {
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "float16": torch.float16,
-    "fp16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-}
-TORCH_DTYPE = _DTYPE_MAP.get(DTYPE_STR, torch.float32)
+# vLLM specific configurations
+# vLLM handles dtype well with 'auto'.
+DTYPE_STR = os.getenv("TORCH_DTYPE", "auto").lower()
 
-LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
-LOAD_IN_4BIT = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
-if (LOAD_IN_8BIT or LOAD_IN_4BIT) and not HAVE_BNB:
-    raise RuntimeError(
-        "bitsandbytes not installed but LOAD_IN_8BIT/LOAD_IN_4BIT requested. "
-        "Install it or disable quantization."
-    )
+# vLLM does not support BitsAndBytes. Use AWQ/GPTQ instead if quantization is needed.
+QUANTIZATION = os.getenv("QUANTIZATION", None)
+# For multi-GPU setups
+TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", 1))
 
 # Auth token
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 
-# Default system prompts (can be empty strings)
+# Default system prompts
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
 
-# Prebuild toggles for constrained vocab
+# Prebuild toggles
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
 
 # -----------------------
-# Model / tokenizer load
+# Model / tokenizer load (vLLM)
 # -----------------------
-quant_config = None
-model_init_kwargs = {
-    "device_map": DEVICE_MAP,
-}
 
-if LOAD_IN_8BIT or LOAD_IN_4BIT:
-    # Lazy import only when needed
-    from transformers import BitsAndBytesConfig
-
-    quant_config = BitsAndBytesConfig(
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT,
-        bnb_4bit_compute_dtype=torch.bfloat16 if TORCH_DTYPE == torch.bfloat16 else torch.float16,
-    )
-    model_init_kwargs["quantization_config"] = quant_config
-else:
-    model_init_kwargs["torch_dtype"] = TORCH_DTYPE
-
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    **model_init_kwargs,
+# Initialize vLLM Async Engine for high throughput
+print(f"Initializing vLLM Async Engine for {MODEL_NAME}...")
+llm = AsyncLLM(
+    model=MODEL_NAME,
+    dtype=DTYPE_STR,
+    quantization=QUANTIZATION,
+    tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+    trust_remote_code=True, # Often needed for models like Qwen
 )
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+# Load tokenizer using transformers for reliable chat template support
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+except Exception:
+    print("Warning: Failed to load AutoTokenizer. Using vLLM internal tokenizer.")
+    tokenizer = llm.get_tokenizer()
+
+# Initialize LM Format Enforcer integration data (done once).
+tokenizer_data = build_vllm_token_enforcer_tokenizer_data(llm)
+
 
 # -----------------------
 # Regex-constrained vocab
 # -----------------------
 @cache
-def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
-    print(f"building prefix function for {lang} ({n_words} words)")
-    with open(lang + ".txt") as fin:
-        words = [word.strip().lower() for word in fin]
+def get_cached_regex_parser(lang: Literal["en", "es"], n_words: int) -> Optional[RegexParser]:
+    """Builds and caches the RegexParser."""
+    # We cache the Parser itself. The logits processor must be created fresh per request.
+    print(f"building regex parser for {lang} ({n_words} words)")
+    try:
+        with open(lang + ".txt") as fin:
+            words = [word.strip().lower() for word in fin]
+    except FileNotFoundError:
+         print(f"Warning: Dictionary file {lang}.txt not found.")
+         return None
+         
     words = words[:n_words]
     # Case-insensitive first char
     word_regexp = "|".join(
@@ -112,27 +103,24 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     )
     word_regexp = "(" + word_regexp + ")"
 
-    # 1. Update to include whitespace (including newlines) using \\s
     punct_regexp = "[-.,!?():;¿!¡\\s]+"
 
-    # 2. Update grammar to allow flexible interleaving and natural EOS
     # Grammar: (Word OR Punctuation)+
     flexible_grammar = f"({word_regexp}|{punct_regexp})+"
     parser = RegexParser(flexible_grammar)
 
-    prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-    return prefix_fn
+    return parser
 
 
 if PREBUILD_PREFIX:
-    print("prebuilding prefix functions...")
-    for lang in ("es",):
+    print("prebuilding regex parsers...")
+    for lang in ("es", "en"):
         for n_words in PREBUILD_WORD_COUNTS:
-            build_regexp_prefix_fn(lang, n_words)
+            get_cached_regex_parser(lang, n_words)
     print("done")
 
 # -----------------------
-# Auth helper
+# Auth helper (No changes needed)
 # -----------------------
 def verify_token(
     token: Optional[str] = Query(default=None),
@@ -140,7 +128,6 @@ def verify_token(
 ):
     supplied = token
     if not supplied and authorization:
-        # Expect "Bearer <token>"
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             supplied = parts[1]
@@ -149,10 +136,109 @@ def verify_token(
     return True
 
 # -----------------------
+# Inference Helpers (NEW)
+# -----------------------
+
+def _create_sampling_params(request) -> SamplingParams:
+    """Helper to map API requests to vLLM SamplingParams and integrate the logits processor."""
+
+    # Initialize defaults and extract parameters based on request type
+    if isinstance(request, GenerateRequest):
+        params = {
+            "max_tokens": request.max_new_tokens,
+            "temperature": 1.0, # Default temperature from original script
+            "top_p": 1.0,
+            "repetition_penalty": request.repetition_penalty or 1.0,
+            "length_penalty": request.length_penalty or 1.0,
+            "num_beams": request.num_beams or 1,
+            "vocab_lang": request.vocab_lang,
+            "vocab_n_words": request.vocab_n_words,
+            "n": 1,
+        }
+    elif isinstance(request, ChatCompletionRequest):
+        params = {
+            "max_tokens": request.max_tokens or 100,
+            "temperature": request.temperature if request.temperature is not None else 1.0,
+            "top_p": request.top_p if request.top_p is not None else 1.0,
+            "repetition_penalty": request.repetition_penalty or 1.0,
+            "length_penalty": request.length_penalty or 1.0,
+            "num_beams": request.num_beams or 1,
+            "vocab_lang": request.vocab_lang,
+            "vocab_n_words": request.vocab_n_words,
+            "stop": request.stop,
+            "n": request.n or 1,
+            "presence_penalty": request.presence_penalty or 0.0,
+            "frequency_penalty": request.frequency_penalty or 0.0,
+        }
+    else:
+        raise ValueError("Invalid request type")
+
+    # Handle Logits Processor (Constrained Generation)
+    logits_processors = []
+    parser = None
+    if params.get("vocab_lang") and params.get("vocab_n_words"):
+        parser = get_cached_regex_parser(params["vocab_lang"], params["vocab_n_words"])
+        if parser:
+            # The logits processor must be created fresh for every new request.
+            logits_processor = build_vllm_logits_processor(tokenizer_data, parser)
+            logits_processors.append(logits_processor)
+
+    # Handle Beam Search
+    use_beam_search = params["num_beams"] > 1
+    
+    if use_beam_search:
+        if parser:
+            # Combining beam search with complex logits processors can sometimes be unstable.
+            print("Note: Beam search requested with format enforcement.")
+        
+        # vLLM requires temperature=0 for beam search
+        params["temperature"] = 0.0
+        best_of = params["num_beams"]
+    else:
+        # best_of must be >= n
+        best_of = params["n"]
+
+    # Construct SamplingParams
+    try:
+        sampling_params = SamplingParams(
+            max_tokens=params["max_tokens"],
+            temperature=params["temperature"],
+            top_p=params["top_p"],
+            repetition_penalty=params["repetition_penalty"],
+            length_penalty=params["length_penalty"],
+            use_beam_search=use_beam_search,
+            best_of=best_of,
+            stop=params.get("stop"),
+            n=params["n"],
+            logits_processors=logits_processors if logits_processors else None,
+            presence_penalty=params.get("presence_penalty"),
+            frequency_penalty=params.get("frequency_penalty"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid sampling parameters: {e}")
+
+    return sampling_params
+
+
+async def run_inference(prompt_text: str, sampling_params: SamplingParams) -> RequestOutput:
+    """Runs the asynchronous vLLM generation and waits for the final output."""
+    request_id = str(uuid.uuid4())
+    # Await the generator creation
+    results_generator = await llm.generate(prompt_text, sampling_params, request_id)
+
+    # Iterate through the generator to get the final result (handles streaming internally)
+    final_output: RequestOutput = None
+    async for request_output in results_generator:
+        final_output = request_output
+    
+    return final_output
+
+# -----------------------
 # Legacy constrained API
 # -----------------------
+# Changed to async def
 @app.post("/generate")
-def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) -> str:
+async def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) -> str:
     system_msg = (
         DEFAULT_SYSTEM_PROMPT_ES
         if request.vocab_lang == "es"
@@ -164,28 +250,23 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         messages.append({"role": "system", "content": system_msg})
     messages.append({"role": "user", "content": request.prompt})
 
-    texts = tokenizer.apply_chat_template(
+    # Apply chat template
+    prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    input_ids = tokenizer(texts, return_tensors="pt").to(model.device)
-    input_len = input_ids["input_ids"].shape[1]
-    prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
 
-    generated_ids = model.generate(
-        **input_ids,
-        max_new_tokens=request.max_new_tokens,
-        prefix_allowed_tokens_fn=prefix_fn,
-        num_beams=request.num_beams,
-        do_sample=True,
-        temperature=1.0,
-        repetition_penalty=request.repetition_penalty,
-        length_penalty=request.length_penalty,
-    )
-    result = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
-    return result
+    # Build Sampling Params using the helper
+    sampling_params = _create_sampling_params(request)
+
+    # Run async inference. vLLM automatically batches concurrent requests.
+    final_output = await run_inference(prompt_text, sampling_params)
+    
+    if final_output and final_output.outputs:
+        return final_output.outputs[0].text
+    return ""
 
 # -----------------------
-# OpenAI-compatible API (optional but useful)
+# OpenAI-compatible API
 # -----------------------
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
@@ -203,7 +284,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     
-    # Move these from extra to direct parameters
+    # Custom parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
@@ -224,18 +305,18 @@ def list_models(auth_ok: bool = Depends(verify_token)):
         ],
     }
 
-
+# Changed to async def
 @app.post("/v1/chat/completions")
-def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
-    # Merge system prompt(s)
+async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
+    start_time = time.time()
+
+    # 1. Prepare Prompt (Logic remains the same)
     system_prompt = DEFAULT_SYSTEM_PROMPT_EN
-    # If any system message provided by client, prefer the first
     for msg in req.messages:
         if msg.role == "system":
             system_prompt = msg.content
             break
 
-    # Build messages for the model
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
@@ -243,52 +324,42 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
-    texts = tokenizer.apply_chat_template(
+    prompt_text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = tokenizer(texts, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
 
-    # Generation params
-    max_new_tokens = req.max_tokens if req.max_tokens is not None else 100
-    do_sample = (req.temperature is None) or (req.temperature > 0)
-    gen_kwargs = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=req.temperature if req.temperature is not None else 1.0,
-        top_p=req.top_p if req.top_p is not None else 1.0,
-    )
+    # 2. Build Sampling Params
+    sampling_params = _create_sampling_params(req)
 
-    # Access parameters directly from req instead of req.extra
-    if req.vocab_lang and req.vocab_n_words:
-        prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
-        gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
-    if req.num_beams:
-        gen_kwargs["num_beams"] = req.num_beams
-    if req.repetition_penalty:
-        gen_kwargs["repetition_penalty"] = req.repetition_penalty
-    if req.length_penalty:
-        gen_kwargs["length_penalty"] = req.length_penalty
+    # 3. Run async inference
+    final_output = await run_inference(prompt_text, sampling_params)
+    
+    if not final_output:
+        raise HTTPException(status_code=500, detail="Generation failed")
 
-    outputs = model.generate(**inputs, **gen_kwargs)
-    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+    # 4. Format the response
+    created = int(start_time)
+    # Token usage accounting (vLLM provides this directly)
+    prompt_tokens = len(final_output.prompt_token_ids)
+    
+    choices = []
+    # Loop through the generated outputs (handles the 'n' parameter)
+    for i, completion_output in enumerate(final_output.outputs):
+        choices.append({
+            "index": i,
+            "message": {"role": "assistant", "content": completion_output.text},
+            "finish_reason": completion_output.finish_reason or "stop",
+        })
 
-    # Token usage accounting (approx)
-    prompt_tokens = int(inputs["input_ids"].shape[1])
-    completion_tokens = int(outputs[0].shape[0] - input_len)
-    created = int(time.time())
+    # Sum tokens if n > 1
+    completion_tokens = sum(len(o.token_ids) for o in final_output.outputs)
+
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
         "created": created,
         "model": req.model or MODEL_NAME,
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }
-        ],
+        "choices": choices,
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
