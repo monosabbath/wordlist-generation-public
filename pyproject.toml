@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate>=1.10.1",
+    # "accelerate>=1.10.1", # Removed: vLLM manages its own acceleration.
     "click>=8.3.0",
     "fastapi[standard]>=0.118.3",
     "httpx>=0.28.1",
@@ -13,10 +13,11 @@ dependencies = [
     "openai>=2.1.0",
     "pydantic>=2.11.10",
     "torch>=2.8.0",
-    "transformers>=4.57.0",
+    "transformers>=4.57.0", # Kept: Used for AutoTokenizer (chat templates).
     "python-dotenv>=1.0.1",
-    # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
-    "bitsandbytes>=0.42.0",
+    # Added vLLM as the inference engine. Use a recent version.
+    "vllm>=0.4.2",
+    # "bitsandbytes>=0.42.0", # Removed: vLLM does not use bitsandbytes.
 ]
 
 [dependency-groups]
