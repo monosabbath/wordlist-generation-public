@@ -1,6 +1,8 @@
 import os
 import time
 import uuid
+import subprocess  # Added for running Tailscale commands
+from contextlib import asynccontextmanager  # Added for lifespan
 from functools import cache
 from typing import Literal, Optional
 
@@ -29,7 +31,71 @@ from common import GenerateRequest
 # Load .env as early as possible
 load_dotenv()
 
-app = FastAPI()
+
+# -----------------------
+# Tailscale Lifespan
+# -----------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Handles application startup and shutdown events.
+    Connects to Tailscale on startup and disconnects on shutdown.
+    """
+    # --- Startup ---
+    print("Attempting to connect to Tailscale...")
+    # Read auth key from environment
+    auth_key = os.getenv("TAILSCALE_AUTH_KEY")
+
+    if auth_key:
+        try:
+            # Run 'tailscale up'
+            # Assumes script is run as root or user has perms (common in containers)
+            command = [
+                "tailscale",
+                "up",
+                "--authkey",
+                auth_key,
+                "--accept-routes", # Good practice for client nodes
+            ]
+            # Using check=True to raise an error if the command fails
+            subprocess.run(
+                command, check=True, capture_output=True, text=True
+            )
+            print("✅ Successfully connected to Tailscale.")
+
+            # Get and print the Tailscale IP address
+            ip_command = ["tailscale", "ip", "-4"]
+            ip_result = subprocess.run(
+                ip_command, check=True, capture_output=True, text=True
+            )
+            print(f"Tailscale IP: {ip_result.stdout.strip()}")
+            print(f"API will be available at: http://{ip_result.stdout.strip()}:8001")
+
+        except FileNotFoundError:
+            print("🚨 ERROR: 'tailscale' command not found. Skipping connection.")
+            print("Please ensure Tailscale is installed in the instance.")
+        except subprocess.CalledProcessError as e:
+            print(f"🚨 ERROR: Failed to connect to Tailscale: {e.stderr}")
+        except Exception as e:
+            print(f"🚨 ERROR: An unexpected error occurred during Tailscale setup: {e}")
+    else:
+        print("⚠️ WARNING: TAILSCALE_AUTH_KEY not set. Skipping Tailscale connection.")
+
+    # Application is now running
+    yield
+
+    # --- Shutdown ---
+    print("Shutting down Tailscale connection...")
+    try:
+        # Run 'tailscale down'
+        subprocess.run(["tailscale", "down"], check=False, capture_output=True)
+        print("Tailscale disconnected.")
+    except Exception as e:
+        print(f"Error disconnecting Tailscale: {e}")
+
+
+# Pass the lifespan manager to the FastAPI app
+app = FastAPI(lifespan=lifespan)
 
 # -----------------------
 # Config via environment
@@ -202,7 +268,7 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[list[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
-    
+
     # Move these from extra to direct parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
@@ -296,3 +362,13 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         },
     }
     return resp
+
+
+# -----------------------
+# Uvicorn Runner
+# -----------------------
+if __name__ == "__main__":
+    import uvicorn
+    # Run the app on port 8001, accessible from any IP (0.0.0.0)
+    print("Starting Uvicorn server on http://0.0.0.0:8001")
+    uvicorn.run(app, host="0.0.0.0", port=8001)
