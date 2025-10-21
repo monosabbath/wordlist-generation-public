@@ -292,12 +292,25 @@ def _create_sampling_params(request) -> SamplingParams:
     # Handle Beam Search
     use_beam_search = params["num_beams"] > 1
 
-    if use_beam_search:
-        if parser:
-            print("Note: Beam search requested with format enforcement.")
+    # CRITICAL FIX: Check for incompatibility between Beam Search and Format Enforcement
+    if use_beam_search and (parser or logits_processors):
+        # The installed version of vLLM does not reliably support logits_processors (used for format enforcement)
+        # when beam search is active (best_of > 1).
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid request: Beam search (num_beams > 1) is currently incompatible with format enforcement (vocab_lang/vocab_n_words) in this vLLM deployment. Please use only one of these features per request."
+        )
 
-        # vLLM requires temperature=0 for beam search
-        params["temperature"] = 0.0
+    if use_beam_search:
+        # vLLM requires temperature=0 and top_p=1.0 for beam search. Enforce this.
+        if params["temperature"] != 0.0:
+             print(f"Warning: Beam search requires temperature=0. Overriding temperature from {params['temperature']} to 0.0.")
+             params["temperature"] = 0.0
+
+        if params["top_p"] != 1.0:
+            print(f"Warning: Beam search requires top_p=1.0. Overriding top_p from {params['top_p']} to 1.0.")
+            params["top_p"] = 1.0
+
         # In modern vLLM, best_of acts as the beam width when temperature is 0.
         best_of = params["num_beams"]
     else:
@@ -323,6 +336,7 @@ def _create_sampling_params(request) -> SamplingParams:
             frequency_penalty=params.get("frequency_penalty"),
         )
     except ValueError as e:
+        # This catches any other configuration errors from vLLM
         raise HTTPException(status_code=400, detail=f"Invalid sampling parameters: {e}")
 
     return sampling_params
@@ -334,7 +348,6 @@ async def run_inference(prompt_text: str, sampling_params: SamplingParams) -> Re
      
     # NOTE: `llm.generate` in modern vLLM is an async method that returns the
     # final RequestOutput directly, not a generator.
-    # If you were using an older vLLM with streaming, the logic below would be different.
     final_output: RequestOutput = await llm.generate(prompt_text, sampling_params, request_id)
 
     return final_output
@@ -367,6 +380,7 @@ async def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_toke
 
 
     # Build Sampling Params using the helper
+    # Error handling for _create_sampling_params is handled within the function
     sampling_params = _create_sampling_params(request)
 
     # Run async inference. vLLM automatically batches concurrent requests.
@@ -493,6 +507,7 @@ async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(v
 
 
     # 2. Build Sampling Params
+    # This will now raise an informative HTTPException if incompatible parameters are used.
     sampling_params = _create_sampling_params(req)
 
     # 3. Run async inference
