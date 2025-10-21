@@ -10,7 +10,8 @@ from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
 
 # Import vLLM Async Engine, SamplingParams, and integrations
-from vllm import AsyncLLM, SamplingParams
+from vllm import AsyncLLMEngine, SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs  # <-- ADDED
 from vllm.outputs import RequestOutput
 from lmformatenforcer.integrations.vllm import (
     build_vllm_logits_processor,
@@ -85,8 +86,10 @@ PREBUILD_WORD_COUNTS = tuple(
 print(f"Initializing vLLM Async Engine for {MODEL_NAME}...")
 print(f"TP Size: {TENSOR_PARALLEL_SIZE}, Quant: {QUANTIZATION}, Dtype: {DTYPE_STR}, Trust Remote: {TRUST_REMOTE_CODE}")
 
+# --- BLOCK MODIFIED ---
+
 # Build initialization arguments dynamically
-llm_kwargs = {
+engine_args_kwargs = {
     "model": MODEL_NAME,
     "dtype": DTYPE_STR,
     "quantization": QUANTIZATION,
@@ -97,15 +100,21 @@ llm_kwargs = {
 
 # Only add max_model_len if specified (i.e., > 0) to override the default
 if MAX_MODEL_LEN > 0:
-    llm_kwargs["max_model_len"] = MAX_MODEL_LEN
+    engine_args_kwargs["max_model_len"] = MAX_MODEL_LEN
     print(f"Overriding Max Model Length to: {MAX_MODEL_LEN}")
 
 try:
-    llm = AsyncLLM(**llm_kwargs)
+    # 1. Create AsyncEngineArgs with your parameters
+    engine_args = AsyncEngineArgs(**engine_args_kwargs)
+    
+    # 2. Initialize the AsyncLLMEngine using .from_engine_args()
+    llm = AsyncLLMEngine.from_engine_args(engine_args)
 except Exception as e:
     print(f"CRITICAL: Failed to initialize vLLM engine: {e}")
     print(f"Ensure you have {TENSOR_PARALLEL_SIZE} GPUs available and the configuration is supported.")
     raise
+
+# --- END MODIFIED BLOCK ---
 
 
 # Load tokenizer using transformers for reliable chat template support
@@ -297,13 +306,11 @@ def _create_sampling_params(request) -> SamplingParams:
 async def run_inference(prompt_text: str, sampling_params: SamplingParams) -> RequestOutput:
     """Runs the asynchronous vLLM generation and waits for the final output."""
     request_id = str(uuid.uuid4())
-    # Await the generator creation
-    results_generator = await llm.generate(prompt_text, sampling_params, request_id)
-
-    # Iterate through the generator to get the final result (handles streaming internally)
-    final_output: RequestOutput = None
-    async for request_output in results_generator:
-        final_output = request_output
+    
+    # NOTE: `llm.generate` in modern vLLM is an async method that returns the
+    # final RequestOutput directly, not a generator.
+    # If you were using an older vLLM with streaming, the logic below would be different.
+    final_output: RequestOutput = await llm.generate(prompt_text, sampling_params, request_id)
 
     return final_output
 
