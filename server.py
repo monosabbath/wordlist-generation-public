@@ -43,6 +43,7 @@ except ImportError:
         prompt: str
         max_new_tokens: int = 100
         repetition_penalty: Optional[float] = 1.0
+        # We keep length_penalty here in the API definition, even if the underlying vLLM version ignores it.
         length_penalty: Optional[float] = 1.0
         num_beams: Optional[int] = 1
         vocab_lang: Optional[Literal["en", "es"]] = None
@@ -156,8 +157,8 @@ def get_cached_regex_parser(lang: Literal["en", "es"], n_words: int) -> Optional
         with open(lang + ".txt") as fin:
             words = [word.strip().lower() for word in fin]
     except FileNotFoundError:
-         print(f"Warning: Dictionary file {lang}.txt not found.")
-         return None
+       print(f"Warning: Dictionary file {lang}.txt not found.")
+       return None
 
     words = words[:n_words]
     # Case-insensitive first char
@@ -223,6 +224,7 @@ class ChatCompletionRequest(BaseModel):
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    # We keep length_penalty here in the API definition, even if the underlying vLLM version ignores it.
     length_penalty: Optional[float] = None
 
 # Model for Explicit Batching
@@ -272,6 +274,10 @@ def _create_sampling_params(request) -> SamplingParams:
     else:
         raise ValueError("Invalid request type")
 
+    # Notify if length_penalty is set but might be ignored (because we are removing it below)
+    if params.get("length_penalty") is not None and params.get("length_penalty") != 1.0:
+        print(f"Warning: length_penalty ({params.get('length_penalty')}) is requested, but may be ignored by this vLLM version.")
+
     # Handle Logits Processor (Constrained Generation)
     logits_processors = []
     parser = None
@@ -292,6 +298,7 @@ def _create_sampling_params(request) -> SamplingParams:
 
         # vLLM requires temperature=0 for beam search
         params["temperature"] = 0.0
+        # In modern vLLM, best_of acts as the beam width when temperature is 0.
         best_of = params["num_beams"]
     else:
         # best_of must be >= n
@@ -299,13 +306,15 @@ def _create_sampling_params(request) -> SamplingParams:
 
     # Construct SamplingParams
     try:
+        # FIX: Removed 'use_beam_search' and 'length_penalty' arguments as they caused TypeErrors
+        # in the installed vLLM version's SamplingParams constructor.
         sampling_params = SamplingParams(
             max_tokens=params["max_tokens"],
             temperature=params["temperature"],
             top_p=params["top_p"],
             repetition_penalty=params["repetition_penalty"],
-            length_penalty=params["length_penalty"],
-            use_beam_search=use_beam_search,
+            # length_penalty=params["length_penalty"], # <-- REMOVED
+            # use_beam_search=use_beam_search, # <-- REMOVED
             best_of=best_of,
             stop=params.get("stop"),
             n=params["n"],
@@ -322,7 +331,7 @@ def _create_sampling_params(request) -> SamplingParams:
 async def run_inference(prompt_text: str, sampling_params: SamplingParams) -> RequestOutput:
     """Runs the asynchronous vLLM generation and waits for the final output."""
     request_id = str(uuid.uuid4())
-    
+     
     # NOTE: `llm.generate` in modern vLLM is an async method that returns the
     # final RequestOutput directly, not a generator.
     # If you were using an older vLLM with streaming, the logic below would be different.
@@ -467,7 +476,7 @@ async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(v
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
-    
+     
     # Add all non-system messages from the request
     for msg in req.messages:
         if msg.role != "system":
