@@ -17,10 +17,18 @@ from lmformatenforcer import RegexParser
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.outputs import RequestOutput
+
+# --- MODIFIED IMPORTS START ---
+# Import the generic builder from the transformers integration
+from lmformatenforcer.integrations.transformers import build_token_enforcer_tokenizer_data
+
+# We still need the VLLM-specific logits processor builder
 from lmformatenforcer.integrations.vllm import (
     build_vllm_logits_processor,
-    build_vllm_token_enforcer_tokenizer_data,
+    # build_vllm_token_enforcer_tokenizer_data, # <-- REMOVED: Caused async conflict
 )
+# --- MODIFIED IMPORTS END ---
+
 from pydantic import BaseModel
 
 # We retain AutoTokenizer to ensure chat templates are applied correctly
@@ -119,16 +127,21 @@ except Exception as e:
 # --- END MODIFIED BLOCK ---
 
 
+# --- FIX START: Synchronous Tokenizer Initialization ---
 # Load tokenizer using transformers for reliable chat template support
 try:
     # Ensure trust_remote_code is used for the tokenizer as well
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 except Exception as e:
-    print(f"Warning: Failed to load AutoTokenizer ({e}). Using vLLM internal tokenizer.")
-    tokenizer = llm.get_tokenizer()
+    # CRITICAL FIX: We must have a synchronous tokenizer for initialization.
+    # The fallback llm.get_tokenizer() is async and cannot be used here synchronously.
+    print(f"CRITICAL: Failed to load AutoTokenizer synchronously ({e}). Cannot initialize format enforcer.")
+    raise
 
 # Initialize LM Format Enforcer integration data (done once).
-tokenizer_data = build_vllm_token_enforcer_tokenizer_data(llm)
+# MODIFIED: Use the generic builder and pass the synchronous tokenizer instance directly.
+tokenizer_data = build_token_enforcer_tokenizer_data(tokenizer)
+# --- FIX END ---
 
 
 # -----------------------
@@ -266,6 +279,7 @@ def _create_sampling_params(request) -> SamplingParams:
         parser = get_cached_regex_parser(params["vocab_lang"], params["vocab_n_words"])
         if parser:
             # The logits processor must be created fresh for every new request.
+            # We use the VLLM builder, passing the tokenizer_data initialized synchronously.
             logits_processor = build_vllm_logits_processor(tokenizer_data, parser)
             logits_processors.append(logits_processor)
 
@@ -333,9 +347,15 @@ async def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_toke
     messages.append({"role": "user", "content": request.prompt})
 
     # Apply chat template
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception as e:
+        # Handle cases where the template fails (e.g., invalid roles for specific models)
+        print(f"Error applying chat template: {e}. Messages: {messages}")
+        raise HTTPException(status_code=400, detail=f"Error applying chat template: {e}")
+
 
     # Build Sampling Params using the helper
     sampling_params = _create_sampling_params(request)
@@ -437,6 +457,7 @@ async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(v
     start_time = time.time()
 
     # 1. Prepare Prompt
+    # Determine the effective system prompt: use the first one in the request if present, otherwise use the default.
     system_prompt = DEFAULT_SYSTEM_PROMPT_EN
     for msg in req.messages:
         if msg.role == "system":
@@ -446,13 +467,21 @@ async def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(v
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
+    
+    # Add all non-system messages from the request
     for msg in req.messages:
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    try:
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception as e:
+        # Handle cases where the template fails (e.g., invalid conversation structure)
+        print(f"Error applying chat template: {e}. Messages: {messages}")
+        raise HTTPException(status_code=400, detail=f"Error applying chat template: {e}")
+
 
     # 2. Build Sampling Params
     sampling_params = _create_sampling_params(req)
