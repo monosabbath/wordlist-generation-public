@@ -178,7 +178,7 @@ def get_cached_regex_parser(lang: Literal["en", "es"], n_words: int) -> Optional
 if PREBUILD_PREFIX:
     print("prebuilding regex parsers...")
     # Ensure both languages are covered for compatibility with other models
-    for lang in ("es", "en"):
+    for lang in ("es",):
         for n_words in PREBUILD_WORD_COUNTS:
             get_cached_regex_parser(lang, n_words)
     print("done")
