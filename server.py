@@ -1,3 +1,8 @@
+# --- MODIFIED: Load .env file at the absolute beginning ---
+from dotenv import load_dotenv
+load_dotenv()
+# ---------------------------------------------------------
+
 import os
 import time
 import uuid
@@ -5,13 +10,12 @@ import asyncio
 from functools import cache
 from typing import Literal, Optional, List
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
 
 # Import vLLM Async Engine, SamplingParams, and integrations
 from vllm import AsyncLLMEngine, SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs  # <-- ADDED
+from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.outputs import RequestOutput
 from lmformatenforcer.integrations.vllm import (
     build_vllm_logits_processor,
@@ -37,9 +41,7 @@ except ImportError:
         vocab_n_words: Optional[int] = None
 
 
-# Load .env as early as possible
-load_dotenv()
-
+# .env is now loaded at the top
 app = FastAPI()
 
 # -----------------------
