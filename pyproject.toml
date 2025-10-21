@@ -6,23 +6,23 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # "accelerate>=1.10.1", # Removed: vLLM manages its own acceleration.
-    "click>=8.3.0",
-    "fastapi[standard]>=0.118.3",
-    "httpx>=0.28.1",
-    "lm-format-enforcer>=0.11.3",
-    "openai>=2.1.0",
-    "pydantic>=2.11.10",
-    "torch>=2.8.0",
-    "transformers>=4.57.0", # Kept: Used for AutoTokenizer (chat templates).
-    "python-dotenv>=1.0.1",
-    # Added vLLM as the inference engine. Use a recent version.
-    "vllm>=0.4.2",
+    "click",
+    "fastapi[standard]",
+    "httpx",
+    "lm-format-enforcer",
+    "openai>=1.0.0", # CORRECTED: Changed from 2.1.0, which is not a valid version.
+    "pydantic",
+    "torch>=2.8.0", # KEPT PIN: See note below on installing Torch.
+    "transformers", # Kept: Used for AutoTokenizer (chat templates).
+    "python-dotenv",
+    # Added vLLM as the inference engine.
+    "vllm", # REMOVED PIN: This will get the latest version and fix your errors.
     # "bitsandbytes>=0.42.0", # Removed: vLLM does not use bitsandbytes.
 ]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.14.0",
+    "ruff", # REMOVED PIN: Get the latest linter.
 ]
 
 [tool.setuptools]
