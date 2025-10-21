@@ -5,23 +5,23 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "accelerate>=1.10.1",
-    "click>=8.3.0",
-    "fastapi[standard]>=0.118.3",
-    "httpx>=0.28.1",
-    "lm-format-enforcer>=0.11.3",
-    "openai>=2.1.0",
-    "pydantic>=2.11.10",
-    "torch>=2.8.0",
-    "transformers>=4.57.0",
-    "python-dotenv>=1.0.1",
+    "accelerate",
+    "click",
+    "fastapi[standard]",
+    "httpx",
+    "lm-format-enforcer",
+    "openai",
+    "pydantic",
+    "torch",
+    "transformers",
+    "python-dotenv",
     # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
-    "bitsandbytes>=0.42.0",
+    "bitsandbytes",
 ]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.14.0",
+    "ruff",
 ]
 
 [tool.setuptools]
