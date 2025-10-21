@@ -43,7 +43,7 @@ except ImportError:
         prompt: str
         max_new_tokens: int = 100
         repetition_penalty: Optional[float] = 1.0
-        # length_penalty: Optional[float] = 1.0  # <-- REMOVED: Caused TypeError
+        length_penalty: Optional[float] = 1.0
         num_beams: Optional[int] = 1
         vocab_lang: Optional[Literal["en", "es"]] = None
         vocab_n_words: Optional[int] = None
@@ -223,7 +223,7 @@ class ChatCompletionRequest(BaseModel):
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
     repetition_penalty: Optional[float] = None
-    # length_penalty: Optional[float] = None # <-- REMOVED: Caused TypeError
+    length_penalty: Optional[float] = None
 
 # Model for Explicit Batching
 class BatchGenerateRequest(BaseModel):
@@ -245,7 +245,7 @@ def _create_sampling_params(request) -> SamplingParams:
             "temperature": 1.0, # Default temperature
             "top_p": 1.0,
             "repetition_penalty": request.repetition_penalty or 1.0,
-            # "length_penalty": request.length_penalty or 1.0, # <-- REMOVED
+            "length_penalty": request.length_penalty or 1.0,
             "num_beams": request.num_beams or 1,
             "vocab_lang": request.vocab_lang,
             "vocab_n_words": request.vocab_n_words,
@@ -260,7 +260,7 @@ def _create_sampling_params(request) -> SamplingParams:
             "temperature": request.temperature if request.temperature is not None else 1.0,
             "top_p": request.top_p if request.top_p is not None else 1.0,
             "repetition_penalty": request.repetition_penalty or 1.0,
-            # "length_penalty": request.length_penalty or 1.0, # <-- REMOVED
+            "length_penalty": request.length_penalty or 1.0,
             "num_beams": request.num_beams or 1,
             "vocab_lang": request.vocab_lang,
             "vocab_n_words": request.vocab_n_words,
@@ -304,7 +304,7 @@ def _create_sampling_params(request) -> SamplingParams:
             temperature=params["temperature"],
             top_p=params["top_p"],
             repetition_penalty=params["repetition_penalty"],
-            # length_penalty=params["length_penalty"], # <-- REMOVED: Caused TypeError
+            length_penalty=params["length_penalty"],
             use_beam_search=use_beam_search,
             best_of=best_of,
             stop=params.get("stop"),
