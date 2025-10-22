@@ -1,10 +1,4 @@
 import os
-import re
-import time
-import uuid
-from functools import cache
-from typing import Literal, Optional
-
 from dotenv import load_dotenv
 
 # Load .env as early as possible
@@ -17,6 +11,12 @@ try:
 except Exception:
     pass
 
+import re
+import time
+import uuid
+from functools import cache
+from typing import Literal, Optional
+
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
@@ -27,8 +27,6 @@ from pydantic import BaseModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    StoppingCriteria,
-    StoppingCriteriaList,
 )
 
 # Optional: only needed if you plan to use 8/4-bit quantization
@@ -100,7 +98,7 @@ MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "1024"))
 # Attention backend override
 ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "").strip()
 
-# Hugging Face auth (HF_TOKEN works with latest huggingface)
+# Hugging Face auth
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 
@@ -196,17 +194,15 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         print(f"Warning: Vocabulary file {filename} is empty or contains no valid words. Skipping build.")
         return None
 
-    # Escape words and build a case-insensitive alternation.
-    # Require a separator after each word to prevent concatenation into new words.
+    # Escape words and build an alternation. We avoid \b because interegular doesn't support it.
     escaped_words = [re.escape(w) for w in words]
     word_alt = "|".join(escaped_words)
-    word_re = f"(?i:(?:{word_alt}))"
-    # Allow optional leading punctuation/whitespace before the first word (models may start with a space)
-    leading_punct_re = r"[-.,!?():;¿¡\s]*"
-    # Require punctuation/whitespace after EACH word (no optional '?')
+    # Case-insensitive: use global inline flag at the start (supported by interegular)
+    # Allow optional punctuation/whitespace after each word; no word-boundary escapes.
     punct_re = r"[-.,!?():;¿¡\s]+"
-    # Pattern: optional leading punct, then one or more occurrences of: whole word + required separator
-    pattern = f"(?:{leading_punct_re}(?:\\b{word_re}\\b{punct_re})+)"
+    core = f"(?:({word_alt})(?:{punct_re})?)+"
+    pattern = f"(?i){core}"
+
     parser = RegexParser(pattern)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
@@ -311,6 +307,16 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     ).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
+    # Calculate max_new_tokens to respect the total token cap
+    max_new_from_request = request.max_new_tokens
+    allowed_new_tokens = max(0, MAX_TOTAL_TOKENS - input_len)
+    if allowed_new_tokens <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No room for generation: input reached MAX_TOTAL_TOKENS. Reduce prompt length or increase MAX_TOTAL_TOKENS.",
+        )
+    max_new_tokens = min(max_new_from_request, allowed_new_tokens)
+
     prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
     if prefix_fn is None:
         raise HTTPException(
@@ -319,11 +325,6 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         )
 
     stop_ids = get_stop_ids(tokenizer)
-
-    # Calculate max_new_tokens to respect the total token cap
-    max_new_from_request = request.max_new_tokens
-    allowed_new_tokens = max(0, MAX_TOTAL_TOKENS - input_len)
-    max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
 
     gen_kwargs = _get_gen_kwargs(
         max_new_tokens=max_new_tokens,
@@ -384,6 +385,10 @@ def list_models(auth_ok: bool = Depends(verify_token)):
     }
 
 
+# Optional: simple token-based stopping on stop strings for OpenAI endpoint
+from transformers import StoppingCriteria, StoppingCriteriaList  # noqa: E402
+
+
 class StopOnTokens(StoppingCriteria):
     def __init__(self, stop_token_ids: list[list[int]]):
         super().__init__()
@@ -425,6 +430,16 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     ).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
+    # Calculate max_new_tokens to respect the total token cap
+    max_new_from_request = req.max_tokens if req.max_tokens is not None else 100
+    allowed_new_tokens = max(0, MAX_TOTAL_TOKENS - input_len)
+    if allowed_new_tokens <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No room for generation: input reached MAX_TOTAL_TOKENS. Reduce prompt length or increase MAX_TOTAL_TOKENS.",
+        )
+    max_new_tokens = min(max_new_from_request, allowed_new_tokens)
+
     # Constrained vocab (optional)
     prefix_fn = None
     if req.vocab_lang and req.vocab_n_words:
@@ -434,11 +449,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
                 status_code=500,
                 detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'. Check server logs for missing/empty .txt files.",
             )
-
-    # Calculate max_new_tokens to respect the total token cap
-    max_new_from_request = req.max_tokens if req.max_tokens is not None else 100
-    allowed_new_tokens = max(0, MAX_TOTAL_TOKENS - input_len)
-    max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
 
     stop_ids = get_stop_ids(tokenizer)
 
