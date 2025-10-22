@@ -194,23 +194,22 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     if not os.path.exists(filename):
         print(f"Warning: Language file not found: {filename}. Skipping build.")
         return None
+
     try:
         with open(filename, encoding="utf-8") as fin:
-            words = [w.strip() for w in fin]
+            words = [w.strip() for w in fin if w.strip()]
     except Exception as e:
         print(f"Error reading language file {filename}: {e}. Skipping build.")
         return None
-    words = [w for w in words if w]
+
     words = words[:n_words]
     if not words:
         print(f"Warning: Vocabulary file {filename} is empty or contains no valid words. Skipping build.")
         return None
 
-    # Escape words and build an alternation that allows ONLY an initial capital.
     alts = []
     for w in words:
-        first = w[0]
-        rest = w[1:]
+        first, rest = w[0], w[1:]
         if first.isalpha():
             esc_rest = re.escape(rest)
             lc, uc = first.lower(), first.upper()
@@ -219,17 +218,18 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
             alts.append(f"(?:{re.escape(w)})")
     word_alt = "|".join(alts)
 
-    # Required separator between words
-    sep_re = r"[-.,!?():;¿¡\s]+"
-    pattern = f"(?:(?:{word_alt})(?:{sep_re}))+"
+    # Include quotes; allow optional leading/trailing separators
+    sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
+    pattern = f"^(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?$"
 
     parser = RegexParser(pattern)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
-    # Always allow EOS and other stop tokens in addition to regex-allowed tokens
     stop_ids = set(get_stop_ids(tokenizer))
+
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
+        # Always allow EOS/stop tokens to prevent dead-ends at the final step.
         return list(allowed | stop_ids)
 
     return wrapped_prefix_fn
