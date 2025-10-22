@@ -94,6 +94,10 @@ model_init_kwargs = {
     "device_map": DEVICE_MAP,
     # Pass the trust_remote_code argument
     "trust_remote_code": TRUST_REMOTE_CODE,
+    # ----------------------------------------------------
+    # FIX: Force download to get latest model files
+    "force_download": True, 
+    # ----------------------------------------------------
 }
 if LOAD_IN_8BIT or LOAD_IN_4BIT:
     # Lazy import only when needed
@@ -106,7 +110,8 @@ if LOAD_IN_8BIT or LOAD_IN_4BIT:
     )
     model_init_kwargs["quantization_config"] = quant_config
 else:
-    model_init_kwargs["torch_dtype"] = TORCH_DTYPE
+    # Use 'dtype' instead of 'torch_dtype' to avoid deprecation warning
+    model_init_kwargs["dtype"] = TORCH_DTYPE
 
 print(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
 model = AutoModelForCausalLM.from_pretrained(
@@ -114,7 +119,14 @@ model = AutoModelForCausalLM.from_pretrained(
     **model_init_kwargs,
 )
 # Pass trust_remote_code to the tokenizer as well
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_NAME, 
+    trust_remote_code=TRUST_REMOTE_CODE,
+    # ----------------------------------------------------
+    # FIX: Force download to get latest tokenizer files
+    force_download=True
+    # ----------------------------------------------------
+)
 
 # -----------------------
 # Helpers for stop tokens (Generalized for various models)
@@ -202,7 +214,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
     # Check both 'en' and 'es' as they are supported in the Literal type
-    for lang in ("es",):
+    for lang in ("es", "en"):
         for n_words in PREBUILD_WORD_COUNTS:
             # The function handles existence checks internally
             build_regexp_prefix_fn(lang, n_words)
@@ -279,7 +291,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         messages, tokenize=False, add_generation_prompt=True
     )
     
-    # CHANGE 2.1: Truncate prompt to 1024 tokens to manage KV cache
+    # Truncate prompt to 1024 tokens to manage KV cache
     input_ids = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = input_ids["input_ids"].shape[1]
 
@@ -289,7 +301,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
 
     stop_ids = get_stop_ids(tokenizer)
     
-    # CHANGE 2.2: Calculate max_new_tokens to respect the 1024 total limit
+    # Calculate max_new_tokens to respect the 1024 total limit
     max_new_from_request = request.max_new_tokens
     allowed_new_tokens = 1024 - input_len
     max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
@@ -372,7 +384,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         messages, tokenize=False, add_generation_prompt=True
     )
     
-    # CHANGE 3.1: Truncate prompt to 1024 tokens to manage KV cache
+    # Truncate prompt to 1024 tokens to manage KV cache
     inputs = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -385,7 +397,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Generation params
     
-    # CHANGE 3.2: Calculate max_new_tokens to respect the 1024 total limit
+    # Calculate max_new_tokens to respect the 1024 total limit
     max_new_from_request = req.max_tokens if req.max_tokens is not None else 100
     allowed_new_tokens = 1024 - input_len # input_len is (at most) 1024
     max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
