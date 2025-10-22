@@ -1,7 +1,7 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
-description = "Constrained generation with vocab regex for Kimi-K2"
+description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,16 +15,18 @@ dependencies = [
     "torch",
     "transformers",
     "python-dotenv",
-    # If you plan to use 8-bit or 4-bit quantization on supported systems:
-    "bitsandbytes; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    # Required by some remote-code tokenizers (e.g., Kimi-K2)
+    # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
+    "bitsandbytes",
+    # ADDED: Required by Kimi-K2 tokenizer
     "tiktoken",
-    # High-performance event loop
-    "uvloop; platform_system != 'Windows'",
+    # ADDED: High-performance event loop seen in traceback
+    "uvloop",
 ]
+
 [dependency-groups]
 dev = [
     "ruff",
 ]
+
 [tool.setuptools]
 py-modules = ["client", "common", "server"]
