@@ -1,29 +1,23 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Constrained generation server using vLLM + LM Format Enforcer"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # "accelerate>=1.10.1", # Removed: vLLM manages its own acceleration.
     "click",
     "fastapi[standard]",
     "httpx",
     "lm-format-enforcer",
-    "openai>=1.0.0", # CORRECTED: Changed from 2.1.0, which is not a valid version.
+    "openai>=1.0.0",
     "pydantic",
-    "torch>=2.8.0", # KEPT PIN: See note below on installing Torch.
-    "transformers", # Kept: Used for AutoTokenizer (chat templates).
+    "transformers",
     "python-dotenv",
-    # Added vLLM as the inference engine.
-    "vllm", # REMOVED PIN: This will get the latest version and fix your errors.
-    # "bitsandbytes>=0.42.0", # Removed: vLLM does not use bitsandbytes.
+    "vllm",
 ]
-
 [dependency-groups]
 dev = [
-    "ruff", # REMOVED PIN: Get the latest linter.
+    "ruff",
 ]
-
 [tool.setuptools]
 py-modules = ["client", "common", "server"]
