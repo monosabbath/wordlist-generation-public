@@ -29,6 +29,22 @@ from transformers import (
     AutoTokenizer,
 )
 
+# -----------------------
+# Compatibility shim for HF cache API changes
+# -----------------------
+ENABLE_CACHE_SHIM = os.getenv("ENABLE_CACHE_SHIM", "true").lower() == "true"
+if ENABLE_CACHE_SHIM:
+    try:
+        from transformers.cache_utils import DynamicCache, StaticCache
+        # Only add if not present (won't affect models on older API)
+        if not hasattr(DynamicCache, "seen_tokens"):
+            DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
+        if not hasattr(StaticCache, "seen_tokens"):
+            StaticCache.seen_tokens = property(lambda self: self.get_seq_length())
+        print("Applied cache compatibility shim (seen_tokens -> get_seq_length).")
+    except Exception as e:
+        print(f"Warning: could not apply cache compatibility shim: {e}")
+
 # Optional: only needed if you plan to use 8/4-bit quantization
 try:
     from transformers import BitsAndBytesConfig  # noqa: F401
@@ -49,9 +65,7 @@ except ImportError:
         repetition_penalty: float = 1.0
         length_penalty: float = 1.0
 
-
 app = FastAPI()
-
 
 # -----------------------
 # Config via environment
@@ -71,6 +85,7 @@ _DTYPE_MAP = {
     "bf16": torch.bfloat16,
 }
 TORCH_DTYPE = _DTYPE_MAP.get(DTYPE_STR, torch.float32)
+
 LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
 LOAD_IN_4BIT = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
 if (LOAD_IN_8BIT or LOAD_IN_4BIT) and not HAVE_BNB:
@@ -100,7 +115,6 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "").strip()
 
 # Hugging Face auth
 HF_TOKEN = os.getenv("HF_TOKEN")
-
 
 # -----------------------
 # Model / tokenizer load
@@ -139,10 +153,10 @@ tokenizer = AutoTokenizer.from_pretrained(
     token=HF_TOKEN,
     trust_remote_code=TRUST_REMOTE_CODE,
 )
+
 # Ensure pad_token_id is set to avoid generate() warnings
 if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
     tokenizer.pad_token_id = tokenizer.eos_token_id
-
 
 # -----------------------
 # Helpers for stop tokens (Generalized for various models)
@@ -170,7 +184,6 @@ def get_stop_ids(tok: AutoTokenizer) -> list[int]:
             pass
     return list(set(stop_ids))  # unique IDs
 
-
 # -----------------------
 # Regex-constrained vocab
 # -----------------------
@@ -194,7 +207,6 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         return None
 
     # Escape words and build an alternation that allows ONLY an initial capital.
-    # No \b, no lookarounds. Interior letters must match exactly as in the vocab.
     alts = []
     for w in words:
         first = w[0]
@@ -207,12 +219,8 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
             alts.append(f"(?:{re.escape(w)})")
     word_alt = "|".join(alts)
 
-    # Required separator between words: at least one punctuation/whitespace char
-    # This forbids concatenating allowed words without a separator.
+    # Required separator between words
     sep_re = r"[-.,!?():;¿¡\s]+"
-
-    # Enforce (WORD SEP)+. EOS is allowed via stop_ids outside regex.
-    # Note: no global (?i) — only the first letter per word is case-tolerant.
     pattern = f"(?:(?:{word_alt})(?:{sep_re}))+"
 
     parser = RegexParser(pattern)
@@ -223,8 +231,8 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
-    return wrapped_prefix_fn
 
+    return wrapped_prefix_fn
 
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
@@ -233,7 +241,6 @@ if PREBUILD_PREFIX:
         for n_words in PREBUILD_WORD_COUNTS:
             build_regexp_prefix_fn(lang, n_words)
     print("done")
-
 
 # -----------------------
 # Auth helper
@@ -251,7 +258,6 @@ def verify_token(
     if SECRET_TOKEN and supplied != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
-
 
 # -----------------------
 # Helper for generation kwargs
@@ -291,7 +297,6 @@ def _get_gen_kwargs(
             gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
     return gen_kwargs
 
-
 # -----------------------
 # Legacy constrained API
 # -----------------------
@@ -307,10 +312,11 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         messages.append({"role": "system", "content": system_msg})
     messages.append({"role": "user", "content": request.prompt})
 
-    # Apply chat template (ChatML-compatible for Kimi-K2)
+    # Apply chat template
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
+
     # Truncate prompt to MAX_TOTAL_TOKENS to reduce KV/VRAM
     inputs = tokenizer(
         text, return_tensors="pt", max_length=MAX_TOTAL_TOKENS, truncation=True
@@ -335,7 +341,6 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         )
 
     stop_ids = get_stop_ids(tokenizer)
-
     gen_kwargs = _get_gen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -354,14 +359,12 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     result = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
     return result
 
-
 # -----------------------
 # OpenAI-compatible API (optional but useful)
 # -----------------------
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -380,7 +383,6 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = None
 
-
 @app.get("/v1/models")
 def list_models(auth_ok: bool = Depends(verify_token)):
     return {
@@ -394,10 +396,8 @@ def list_models(auth_ok: bool = Depends(verify_token)):
         ],
     }
 
-
 # Optional: simple token-based stopping on stop strings for OpenAI endpoint
 from transformers import StoppingCriteria, StoppingCriteriaList  # noqa: E402
-
 
 class StopOnTokens(StoppingCriteria):
     def __init__(self, stop_token_ids: list[list[int]]):
@@ -411,7 +411,6 @@ class StopOnTokens(StoppingCriteria):
             if L > 0 and len(seq) >= L and seq[-L:] == stop_seq:
                 return True
         return False
-
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
@@ -494,7 +493,9 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Token usage accounting (approx)
     prompt_tokens = int(inputs["input_ids"].shape[1])
-    completion_tokens = int(outputs[0].shape[0] - input_len)
+    total_len = int(outputs[0].shape[-1])
+    completion_tokens = max(0, total_len - input_len)
+
     created = int(time.time())
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
