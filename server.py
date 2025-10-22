@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-# Load .env as early as possible, BEFORE other imports
+# CHANGE 1: Load .env as early as possible, BEFORE other imports
 load_dotenv()
 
 import time
@@ -278,7 +278,9 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     texts = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    input_ids = tokenizer(texts, return_tensors="pt").to(model.device)
+    
+    # CHANGE 2.1: Truncate prompt to 1024 tokens to manage KV cache
+    input_ids = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = input_ids["input_ids"].shape[1]
 
     prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
@@ -287,8 +289,13 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
 
     stop_ids = get_stop_ids(tokenizer)
     
+    # CHANGE 2.2: Calculate max_new_tokens to respect the 1024 total limit
+    max_new_from_request = request.max_new_tokens
+    allowed_new_tokens = 1024 - input_len
+    max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
+    
     gen_kwargs = _get_gen_kwargs(
-        max_new_tokens=request.max_new_tokens,
+        max_new_tokens=max_new_tokens, # Use calculated value
         stop_ids=stop_ids,
         temperature=1.0, # Legacy API uses fixed temperature 1.0
         num_beams=request.num_beams,
@@ -364,7 +371,9 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     texts = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
-    inputs = tokenizer(texts, return_tensors="pt").to(model.device)
+    
+    # CHANGE 3.1: Truncate prompt to 1024 tokens to manage KV cache
+    inputs = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
     # Constrained vocab (optional)
@@ -375,11 +384,16 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
              raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'. Check server logs for missing/empty .txt files.")
 
     # Generation params
-    max_new_tokens = req.max_tokens if req.max_tokens is not None else 100
+    
+    # CHANGE 3.2: Calculate max_new_tokens to respect the 1024 total limit
+    max_new_from_request = req.max_tokens if req.max_tokens is not None else 100
+    allowed_new_tokens = 1024 - input_len # input_len is (at most) 1024
+    max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
+    
     stop_ids = get_stop_ids(tokenizer)
 
     gen_kwargs = _get_gen_kwargs(
-        max_new_tokens=max_new_tokens,
+        max_new_tokens=max_new_tokens, # Use calculated value
         stop_ids=stop_ids,
         temperature=req.temperature,
         top_p=req.top_p,
