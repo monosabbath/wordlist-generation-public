@@ -187,32 +187,42 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     except Exception as e:
         print(f"Error reading language file {filename}: {e}. Skipping build.")
         return None
-
     words = [w for w in words if w]
     words = words[:n_words]
     if not words:
         print(f"Warning: Vocabulary file {filename} is empty or contains no valid words. Skipping build.")
         return None
 
-    # Escape words and build an alternation. We avoid \b because interegular doesn't support it.
-    escaped_words = [re.escape(w) for w in words]
-    word_alt = "|".join(escaped_words)
-    # Case-insensitive: use global inline flag at the start (supported by interegular)
-    # Allow optional punctuation/whitespace after each word; no word-boundary escapes.
-    punct_re = r"[-.,!?():;¿¡\s]+"
-    core = f"(?:({word_alt})(?:{punct_re})?)+"
-    pattern = f"(?i){core}"
+    # Escape words and build an alternation that allows ONLY an initial capital.
+    # No \b, no lookarounds. Interior letters must match exactly as in the vocab.
+    alts = []
+    for w in words:
+        first = w[0]
+        rest = w[1:]
+        if first.isalpha():
+            esc_rest = re.escape(rest)
+            lc, uc = first.lower(), first.upper()
+            alts.append(f"(?:[{lc}{uc}]{esc_rest})")
+        else:
+            alts.append(f"(?:{re.escape(w)})")
+    word_alt = "|".join(alts)
+
+    # Required separator between words: at least one punctuation/whitespace char
+    # This forbids concatenating allowed words without a separator.
+    sep_re = r"[-.,!?():;¿¡\s]+"
+
+    # Enforce (WORD SEP)+. EOS is allowed via stop_ids outside regex.
+    # Note: no global (?i) — only the first letter per word is case-tolerant.
+    pattern = f"(?:(?:{word_alt})(?:{sep_re}))+"
 
     parser = RegexParser(pattern)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
     # Always allow EOS and other stop tokens in addition to regex-allowed tokens
     stop_ids = set(get_stop_ids(tokenizer))
-
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
-
     return wrapped_prefix_fn
 
 
