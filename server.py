@@ -23,7 +23,19 @@ try:
 except Exception:
     HAVE_BNB = False
 
-from common import GenerateRequest
+# Assuming 'common.py' contains GenerateRequest. If not, define a placeholder.
+try:
+    from common import GenerateRequest
+except ImportError:
+    # Define placeholder based on usage in the script if common.py is missing
+    class GenerateRequest(BaseModel):
+        prompt: str
+        vocab_lang: Literal["en", "es"] = "en"
+        vocab_n_words: int = 1000
+        max_new_tokens: int = 100
+        num_beams: int = 1
+        repetition_penalty: float = 1.0
+        length_penalty: float = 1.0
 
 # Load .env as early as possible
 load_dotenv()
@@ -35,6 +47,8 @@ app = FastAPI()
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
 DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")
+# NEW: Configuration for trusting remote code (required for Kimi-K2)
+TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 
 # Quantization / dtype
 DTYPE_STR = os.getenv("TORCH_DTYPE", "float32").lower()
@@ -75,6 +89,8 @@ PREBUILD_WORD_COUNTS = tuple(
 quant_config = None
 model_init_kwargs = {
     "device_map": DEVICE_MAP,
+    # Pass the trust_remote_code argument
+    "trust_remote_code": TRUST_REMOTE_CODE,
 }
 if LOAD_IN_8BIT or LOAD_IN_4BIT:
     # Lazy import only when needed
@@ -89,28 +105,49 @@ if LOAD_IN_8BIT or LOAD_IN_4BIT:
 else:
     model_init_kwargs["torch_dtype"] = TORCH_DTYPE
 
+print(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     **model_init_kwargs,
 )
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# Pass trust_remote_code to the tokenizer as well
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 
 # -----------------------
-# Helpers for stop tokens (EOS and Gemma <end_of_turn>)
+# Helpers for stop tokens (Generalized for various models)
 # -----------------------
 def get_stop_ids(tok: AutoTokenizer) -> list[int]:
     stop_ids: list[int] = []
+    
+    # 1. Add the tokenizer's defined EOS token(s)
     if tok.eos_token_id is not None:
-        stop_ids.append(tok.eos_token_id)
-    # Try both forms used in docs/tooling
-    for special in ("<end_of_turn>", "<end_of_turn>\n"):
+        # Handle cases where eos_token_id might be a list (e.g. Llama 3.1) or an int
+        if isinstance(tok.eos_token_id, int):
+            stop_ids.append(tok.eos_token_id)
+        elif isinstance(tok.eos_token_id, list):
+            stop_ids.extend(tok.eos_token_id)
+
+    # 2. Add common special tokens used by various models, if they exist in the tokenizer
+    # Gemma: <end_of_turn>
+    # Llama 3: <|eot_id|>
+    # ChatML (Kimi, Qwen): <|im_end|>
+    common_end_markers = (
+        "<end_of_turn>",
+        "<|eot_id|>",
+        "<|im_end|>",
+    )
+
+    for special in common_end_markers:
         try:
             eid = tok.convert_tokens_to_ids(special)
-            if eid is not None and eid != tok.unk_token_id and eid not in stop_ids:
+            # Ensure the ID is valid (not None, not UNK)
+            if eid is not None and eid != tok.unk_token_id:
                 stop_ids.append(eid)
         except Exception:
+            # Tokenizer might raise error if token is unrecognized
             pass
-    return stop_ids
+            
+    return list(set(stop_ids)) # Return unique IDs
 
 # -----------------------
 # Regex-constrained vocab
@@ -118,9 +155,25 @@ def get_stop_ids(tok: AutoTokenizer) -> list[int]:
 @cache
 def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     print(f"building prefix function for {lang} ({n_words} words)")
-    with open(lang + ".txt") as fin:
-        words = [word.strip().lower() for word in fin]
+    
+    filename = lang + ".txt"
+    if not os.path.exists(filename):
+        print(f"Warning: Language file not found: {filename}. Skipping build.")
+        return None
+
+    try:
+        with open(filename) as fin:
+            words = [word.strip().lower() for word in fin]
+    except Exception as e:
+        print(f"Error reading language file {filename}: {e}. Skipping build.")
+        return None
+
     words = words[:n_words]
+    
+    if not words:
+        print(f"Warning: Vocabulary file {filename} is empty or contains no valid words. Skipping build.")
+        return None
+
     # Case-insensitive first char
     word_regexp = "|".join(
         "[" + w[0].lower() + w[0].upper() + "]" + w[1:] for w in words if w
@@ -134,7 +187,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
-    # Always allow EOS and Gemma's end-of-turn tokens in addition to regex-allowed tokens
+    # Always allow EOS and other stop tokens in addition to regex-allowed tokens
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -145,8 +198,10 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
 
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
-    for lang in ("es",):
+    # Check both 'en' and 'es' as they are supported in the Literal type
+    for lang in ("es", "en"):
         for n_words in PREBUILD_WORD_COUNTS:
+            # The function handles existence checks internally
             build_regexp_prefix_fn(lang, n_words)
     print("done")
 
@@ -168,6 +223,40 @@ def verify_token(
     return True
 
 # -----------------------
+# Helper for generation kwargs (Refactored)
+# -----------------------
+def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_beams=None, repetition_penalty=None, length_penalty=None, prefix_fn=None):
+    """Helper to consolidate generation arguments."""
+    do_sample = (temperature is None) or (temperature > 0)
+    
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature if temperature is not None else 1.0,
+        top_p=top_p if top_p is not None else 1.0,
+    )
+
+    if prefix_fn:
+        gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+    if num_beams:
+        gen_kwargs["num_beams"] = num_beams
+    if repetition_penalty:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+    if length_penalty:
+        gen_kwargs["length_penalty"] = length_penalty
+
+    if stop_ids:
+        gen_kwargs["eos_token_id"] = stop_ids
+        # Ensure pad_token_id is set to avoid warnings. Use tokenizer's pad token or the first stop token.
+        if tokenizer.pad_token_id is not None:
+             gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+        else:
+            # Ensure we pick a single integer ID if stop_ids is a list
+            gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
+            
+    return gen_kwargs
+
+# -----------------------
 # Legacy constrained API
 # -----------------------
 @app.post("/generate")
@@ -182,6 +271,7 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
         messages.append({"role": "system", "content": system_msg})
     messages.append({"role": "user", "content": request.prompt})
 
+    # apply_chat_template correctly uses the model's specific format (e.g., ChatML for Kimi-K2)
     texts = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
@@ -189,22 +279,20 @@ def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) ->
     input_len = input_ids["input_ids"].shape[1]
 
     prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
+    if prefix_fn is None:
+        raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{request.vocab_lang}'. Check server logs for missing/empty .txt files.")
 
-    # Ensure generation can stop on EOS or Gemma end-of-turn
     stop_ids = get_stop_ids(tokenizer)
-    gen_kwargs = dict(
+    
+    gen_kwargs = _get_gen_kwargs(
         max_new_tokens=request.max_new_tokens,
-        prefix_allowed_tokens_fn=prefix_fn,
+        stop_ids=stop_ids,
+        temperature=1.0, # Legacy API uses fixed temperature 1.0
         num_beams=request.num_beams,
-        do_sample=True,
-        temperature=1.0,
         repetition_penalty=request.repetition_penalty,
         length_penalty=request.length_penalty,
+        prefix_fn=prefix_fn
     )
-    if stop_ids:
-        gen_kwargs["eos_token_id"] = stop_ids
-        # Use a valid pad token to silence warnings; reuse a stop token if no pad is defined
-        gen_kwargs["pad_token_id"] = stop_ids[0]
 
     generated_ids = model.generate(
         **input_ids,
@@ -252,8 +340,10 @@ def list_models(auth_ok: bool = Depends(verify_token)):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
-    # Merge system prompt(s)
+    # Determine system prompt
+    # Start with the default English prompt (as in the original script for this endpoint)
     system_prompt = DEFAULT_SYSTEM_PROMPT_EN
+
     # If any system message provided by client, prefer the first
     for msg in req.messages:
         if msg.role == "system":
@@ -274,35 +364,27 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     inputs = tokenizer(texts, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
-    # Generation params
-    max_new_tokens = req.max_tokens if req.max_tokens is not None else 100
-    do_sample = (req.temperature is None) or (req.temperature > 0)
-
-    gen_kwargs = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=req.temperature if req.temperature is not None else 1.0,
-        top_p=req.top_p if req.top_p is not None else 1.0,
-    )
-
     # Constrained vocab (optional)
+    prefix_fn = None
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
-        gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+        if prefix_fn is None:
+             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'. Check server logs for missing/empty .txt files.")
 
-    # Beam/search penalties
-    if req.num_beams:
-        gen_kwargs["num_beams"] = req.num_beams
-    if req.repetition_penalty:
-        gen_kwargs["repetition_penalty"] = req.repetition_penalty
-    if req.length_penalty:
-        gen_kwargs["length_penalty"] = req.length_penalty
-
-    # Ensure generation can stop on EOS or Gemma end-of-turn
+    # Generation params
+    max_new_tokens = req.max_tokens if req.max_tokens is not None else 100
     stop_ids = get_stop_ids(tokenizer)
-    if stop_ids:
-        gen_kwargs["eos_token_id"] = stop_ids
-        gen_kwargs["pad_token_id"] = stop_ids[0]
+
+    gen_kwargs = _get_gen_kwargs(
+        max_new_tokens=max_new_tokens,
+        stop_ids=stop_ids,
+        temperature=req.temperature,
+        top_p=req.top_p,
+        num_beams=req.num_beams,
+        repetition_penalty=req.repetition_penalty,
+        length_penalty=req.length_penalty,
+        prefix_fn=prefix_fn
+    )
 
     outputs = model.generate(**inputs, **gen_kwargs)
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
