@@ -17,6 +17,10 @@ dependencies = [
     "python-dotenv",
     # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
     "bitsandbytes",
+    # ADDED: Required by Kimi-K2 tokenizer
+    "tiktoken",
+    # ADDED: High-performance event loop seen in traceback
+    "uvloop",
 ]
 
 [dependency-groups]
