@@ -202,7 +202,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
     # Check both 'en' and 'es' as they are supported in the Literal type
-    for lang in ("es", "en"):
+    for lang in ("es",):
         for n_words in PREBUILD_WORD_COUNTS:
             # The function handles existence checks internally
             build_regexp_prefix_fn(lang, n_words)
