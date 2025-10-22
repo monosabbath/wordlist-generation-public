@@ -433,7 +433,10 @@ async def generate(
     # Apply chat template, with a fallback to raw prompt
     try:
         prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True,
+            enable_thinking=False  # <-- MODIFICATION
         )
     except Exception as e:
         print(f"Error applying chat template: {e}. Falling back to raw prompt.")
@@ -471,7 +474,10 @@ async def generate_batch(
             messages.append({"role": "user", "content": request.prompt})
             try:
                 prompt_text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, 
+                    tokenize=False, 
+                    add_generation_prompt=True,
+                    enable_thinking=False  # <-- MODIFICATION
                 )
             except Exception as e:
                 print(
@@ -546,7 +552,10 @@ async def chat_completions(
     # 3) Apply chat template (fallback to last user message)
     try:
         prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+            messages, 
+            tokenize=False, 
+            add_generation_prompt=True,
+            enable_thinking=False  # <-- MODIFICATION
         )
     except Exception as e:
         print(f"Error applying chat template: {e}. Messages: {messages}")
