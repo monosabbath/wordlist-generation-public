@@ -1,9 +1,13 @@
 import os
+from dotenv import load_dotenv
+
+# Load .env as early as possible, BEFORE other imports
+load_dotenv()
+
 import time
 import uuid
 from functools import cache
 from typing import Literal, Optional
-from dotenv import load_dotenv
 import torch
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from lmformatenforcer import RegexParser
@@ -37,8 +41,7 @@ except ImportError:
         repetition_penalty: float = 1.0
         length_penalty: float = 1.0
 
-# Load .env as early as possible
-load_dotenv()
+# NOTE: The original load_dotenv() call was here and has been moved to the top.
 
 app = FastAPI()
 
