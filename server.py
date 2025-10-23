@@ -20,12 +20,7 @@ from transformers import (
     AutoTokenizer,
 )
 
-# Optional: only needed if you plan to use 8/4-bit quantization
-try:
-    from transformers import BitsAndBytesConfig  # noqa: F401
-    HAVE_BNB = True
-except Exception:
-    HAVE_BNB = False
+# NOTE: Quantization (BitsAndBytesConfig, HAVE_BNB) checks have been removed.
 
 # Assuming 'common.py' contains GenerateRequest. If not, define a placeholder.
 try:
@@ -53,7 +48,7 @@ DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")
 # NEW: Configuration for trusting remote code (required for Kimi-K2)
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 
-# Quantization / dtype
+# Precision / dtype
 DTYPE_STR = os.getenv("TORCH_DTYPE", "float32").lower()
 _DTYPE_MAP = {
     "float32": torch.float32,
@@ -65,13 +60,7 @@ _DTYPE_MAP = {
 }
 TORCH_DTYPE = _DTYPE_MAP.get(DTYPE_STR, torch.float32)
 
-LOAD_IN_8BIT = os.getenv("LOAD_IN_8BIT", "false").lower() == "true"
-LOAD_IN_4BIT = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
-if (LOAD_IN_8BIT or LOAD_IN_4BIT) and not HAVE_BNB:
-    raise RuntimeError(
-        "bitsandbytes not installed but LOAD_IN_8BIT/LOAD_IN_4BIT requested. "
-        "Install it or disable quantization."
-    )
+# NOTE: LOAD_IN_8BIT and LOAD_IN_4BIT variables and checks have been removed.
 
 # Auth token
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
@@ -89,24 +78,16 @@ PREBUILD_WORD_COUNTS = tuple(
 # -----------------------
 # Model / tokenizer load
 # -----------------------
-quant_config = None
+# NOTE: Quantization config block has been removed.
+# We now directly pass torch_dtype.
 model_init_kwargs = {
     "device_map": DEVICE_MAP,
     # Pass the trust_remote_code argument
     "trust_remote_code": TRUST_REMOTE_CODE,
+    # Directly set the dtype, as quantization is removed
+    "torch_dtype": TORCH_DTYPE,
 }
-if LOAD_IN_8BIT or LOAD_IN_4BIT:
-    # Lazy import only when needed
-    from transformers import BitsAndBytesConfig
 
-    quant_config = BitsAndBytesConfig(
-        load_in_8bit=LOAD_IN_8BIT,
-        load_in_4bit=LOAD_IN_4BIT,
-        bnb_4bit_compute_dtype=torch.bfloat16 if TORCH_DTYPE == torch.bfloat16 else torch.float16,
-    )
-    model_init_kwargs["quantization_config"] = quant_config
-else:
-    model_init_kwargs["torch_dtype"] = TORCH_DTYPE
 
 print(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
 model = AutoModelForCausalLM.from_pretrained(
