@@ -277,10 +277,12 @@ def _build_vllm_server_cmd() -> list[str]:
         VLLM_HOST,
         "--port",
         str(VLLM_PORT),
-        "--log-level",
+        # NOTE: newer vLLM uses --uvicorn-log-level (not --log-level)
+        "--uvicorn-log-level",
         VLLM_LOG_LEVEL,
-        "--guided-decoding-backend",
-        "lm-format-enforcer",
+        # We remove the deprecated server-wide flag and rely on per-request
+        # guided_decoding_backend="lm-format-enforcer" that we inject in extra_body.
+        # "--guided-decoding-backend", "lm-format-enforcer",
     ]
     if TENSOR_PARALLEL_SIZE and TENSOR_PARALLEL_SIZE > 1:
         cmd += ["--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE)]
@@ -294,8 +296,6 @@ def _build_vllm_server_cmd() -> list[str]:
         cmd += ["--max-model-len", str(MAX_MODEL_LEN)]
     if TRUST_REMOTE_CODE:
         cmd += ["--trust-remote-code"]
-    # Optional: override served-model-name if you want a friendly name
-    # cmd += ["--served-model-name", MODEL_NAME]
     return cmd
 
 async def _wait_for_vllm_ready(timeout_s: float = 180.0) -> None:
