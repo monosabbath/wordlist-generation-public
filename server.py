@@ -178,7 +178,7 @@ def get_cached_regex_parser(
     # Allow typical punctuation and spaces between words (includes quotes)
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
     # Allow optional leading SEP and optional trailing SEP
-    pattern = f"^(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?$"
+    pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
     return RegexParser(pattern)
 
 
