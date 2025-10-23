@@ -1,6 +1,7 @@
 # --- Load environment ASAP ---
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import re
 import time
@@ -9,7 +10,7 @@ import asyncio
 from typing import Literal, Optional, List
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel, ConfigDict  # <-- MODIFICATION
+from pydantic import BaseModel, ConfigDict
 
 # lm-format-enforcer
 try:
@@ -17,15 +18,19 @@ try:
 except ImportError:
     # Fallback import path in some installations
     from lmformatenforcer.regexparser import RegexParser
-from lmformatenforcer.integrations.transformers import build_token_enforcer_tokenizer_data
-from lmformatenforcer.integrations.vllm import build_vllm_logits_processor
+
+# Use the vLLM integration for tokenizer data + logits processor
+from lmformatenforcer.integrations.vllm import (
+    build_vllm_logits_processor,
+    build_vllm_token_enforcer_tokenizer_data,
+)
 
 # vLLM
 from vllm import AsyncLLMEngine, SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.outputs import RequestOutput
 
-# HF tokenizer
+# HF tokenizer (only for chat template convenience)
 from transformers import AutoTokenizer
 
 # functools.cache fallback for older Python
@@ -51,6 +56,7 @@ except ImportError:
         vocab_lang: Optional[Literal["en", "es"]] = None
         vocab_n_words: Optional[int] = None
 
+
 # =========================
 # FastAPI app
 # =========================
@@ -66,15 +72,19 @@ TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", 1))
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", 0.90))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", 0))
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
+
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
+
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
+
 # Optional HF token for gated models/tokenizers
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
 # Optional: enable lm-format-enforcer analyzer
 LOGITS_ANALYZE = os.getenv("LOGITS_ANALYZE", "false").lower() == "true"
 
@@ -85,6 +95,7 @@ print(f"Initializing vLLM Async Engine for {MODEL_NAME}...")
 print(
     f"TP Size: {TENSOR_PARALLEL_SIZE}, Quant: {QUANTIZATION}, Dtype: {DTYPE_STR}, Trust Remote: {TRUST_REMOTE_CODE}"
 )
+
 engine_args_kwargs = {
     "model": MODEL_NAME,
     "dtype": DTYPE_STR,
@@ -96,6 +107,7 @@ engine_args_kwargs = {
 if MAX_MODEL_LEN > 0:
     engine_args_kwargs["max_model_len"] = MAX_MODEL_LEN
     print(f"Overriding Max Model Length to: {MAX_MODEL_LEN}")
+
 try:
     engine_args = AsyncEngineArgs(**engine_args_kwargs)
     llm = AsyncLLMEngine.from_engine_args(engine_args)
@@ -107,7 +119,7 @@ except Exception as e:
     raise
 
 # =========================
-# Tokenizer (synchronous)
+# Tokenizer (synchronous, for chat template)
 # =========================
 try:
     tokenizer = AutoTokenizer.from_pretrained(
@@ -119,8 +131,12 @@ except Exception as e:
     )
     raise
 
-# Build tokenizer_data for vLLM logits processor once
-tokenizer_data = build_token_enforcer_tokenizer_data(tokenizer)
+# Build tokenizer_data for vLLM logits processor once (use vLLM integration)
+try:
+    tokenizer_data = build_vllm_token_enforcer_tokenizer_data(llm)
+except Exception as e:
+    print(f"CRITICAL: Failed to build vLLM tokenizer data for enforcer: {e}")
+    raise
 
 # =========================
 # Wordlist-based RegexParser
@@ -144,19 +160,16 @@ def get_cached_regex_parser(
     lang: Literal["en", "es"], n_words: int
 ) -> Optional[RegexParser]:
     """
-    Build a case-flexible wordlist regex parser with optional trailing punctuation,
-    adapted from the user's transformers prefix function.
+    Build a case-flexible wordlist regex parser with optional trailing punctuation.
     Grammar (prefix-friendly):
       (SEP)? (WORD) (SEP WORD)* (SEP)?
-    where:
-      WORD matches any word from the list with only the initial letter case-insensitive.
-      SEP  matches punctuation/whitespace between words.
     """
     try:
         words = _load_words(lang, n_words)
     except FileNotFoundError as e:
         print(str(e))
         return None
+
     if not words:
         print(f"Warning: {lang}.txt is empty or contains no valid words.")
         return None
@@ -177,19 +190,17 @@ def get_cached_regex_parser(
     word_alt = "|".join(alts)
     # Allow typical punctuation and spaces between words (includes quotes)
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
-    # Allow optional leading SEP and optional trailing SEP
-    # Removed ^ and $ anchors as they are unsupported by interegular
+    # Allow optional leading SEP and optional trailing SEP (no ^/$ anchors)
     pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
     return RegexParser(pattern)
 
 
 if PREBUILD_PREFIX:
-    print("prebuilding regex parsers...")
-    # Only Spanish prebuild as requested
-    for lang in ("es",):
+    print("Prebuilding regex parsers...")
+    for lang in ("es",):  # Prebuild Spanish as requested
         for n_words in PREBUILD_WORD_COUNTS:
             get_cached_regex_parser(lang, n_words)
-    print("done")
+    print("Done prebuilding.")
 
 # =========================
 # Auth helper
@@ -201,7 +212,7 @@ def verify_token(
     supplied = token
     if not supplied and authorization:
         parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
+        if len(parts) >= 2 and parts[0].lower() == "bearer":
             supplied = parts[1]
     if SECRET_TOKEN and supplied != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -217,15 +228,14 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra='ignore')  # <-- MODIFICATION
-
+    model_config = ConfigDict(extra="ignore")
     model: str
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
-    stop: Optional[list[str] | str] = None
+    stop: Optional[List[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     # Custom parameters
@@ -273,12 +283,10 @@ def _build_logits_processors(vocab_lang, vocab_n_words):
     return parser, [logits_proc]
 
 
-def _sig_has_param(param: str) -> bool:
+def _sp_has_field(field: str) -> bool:
+    # SamplingParams is a Pydantic v2 BaseModel; use model_fields instead of inspect.signature
     try:
-        from inspect import signature
-
-        sig = signature(SamplingParams.__init__)
-        return param in sig.parameters
+        return field in getattr(SamplingParams, "model_fields", {})
     except Exception:
         return False
 
@@ -308,11 +316,7 @@ def _create_sampling_params(request) -> SamplingParams:
             "max_tokens": request.max_tokens or 100,
             "temperature": 0.0
             if (request.num_beams and request.num_beams > 1)
-            else (
-                request.temperature
-                if request.temperature is not None
-                else 1.0
-            ),
+            else (request.temperature if request.temperature is not None else 1.0),
             "top_p": 1.0
             if (request.num_beams and request.num_beams > 1)
             else (request.top_p if request.top_p is not None else 1.0),
@@ -344,7 +348,6 @@ def _create_sampling_params(request) -> SamplingParams:
     # Beam search handling
     use_beam_search = params["num_beams"] > 1
     if use_beam_search:
-        # In vLLM, use_beam_search=True, best_of = beam width, and n <= best_of
         beam_width = params["num_beams"]
         if params["n"] > beam_width:
             raise HTTPException(
@@ -352,13 +355,13 @@ def _create_sampling_params(request) -> SamplingParams:
                 detail=f"n ({params['n']}) cannot exceed num_beams ({beam_width}) when using beam search.",
             )
         best_of = beam_width
-        # Enforce deterministic decoding settings commonly required by vLLM beam search
+        # deterministic settings with beam search
         params["temperature"] = 0.0
         params["top_p"] = 1.0
     else:
         best_of = max(1, params["n"])
 
-    # Assemble SamplingParams kwargs, adding optional keys only if supported by this vLLM build
+    # Assemble SamplingParams kwargs
     sp_kwargs = dict(
         max_tokens=params["max_tokens"],
         temperature=params["temperature"],
@@ -369,39 +372,39 @@ def _create_sampling_params(request) -> SamplingParams:
         n=params["n"],
     )
 
-    # Optional parameters (guard by signature)
-    if _sig_has_param("use_beam_search"):
+    # Optional parameters (guarded by Pydantic model_fields)
+    if _sp_has_field("use_beam_search"):
         sp_kwargs["use_beam_search"] = use_beam_search
     elif use_beam_search:
-        # If this build doesn't support the flag, fail early with a helpful error
         raise HTTPException(
             status_code=400,
-            detail="This vLLM build does not support use_beam_search in SamplingParams.",
+            detail="This vLLM build does not support use_beam_search in SamplingParams. Upgrade vLLM.",
         )
 
-    if _sig_has_param("length_penalty") and params["length_penalty"] is not None:
+    if _sp_has_field("length_penalty") and params["length_penalty"] is not None:
         sp_kwargs["length_penalty"] = params["length_penalty"]
-    if _sig_has_param("early_stopping") and params.get("early_stopping") is not None:
+    if _sp_has_field("early_stopping") and params.get("early_stopping") is not None:
         sp_kwargs["early_stopping"] = params["early_stopping"]
-    if _sig_has_param("presence_penalty"):
+    if _sp_has_field("presence_penalty"):
         sp_kwargs["presence_penalty"] = params.get("presence_penalty", 0.0)
-    if _sig_has_param("frequency_penalty"):
+    if _sp_has_field("frequency_penalty"):
         sp_kwargs["frequency_penalty"] = params.get("frequency_penalty", 0.0)
-
-    # Add logits processors only if supported by this vLLM build
-    if logits_processors:
-        if _sig_has_param("logits_processors"):
-            sp_kwargs["logits_processors"] = logits_processors
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="This vLLM build does not support logits_processors. Upgrade vLLM to use format enforcement.",
-            )
 
     try:
         sampling_params = SamplingParams(**sp_kwargs)
     except (ValueError, TypeError) as e:
         raise HTTPException(status_code=400, detail=f"Invalid sampling parameters: {e}")
+
+    # Set logits processors AFTER construction
+    if logits_processors:
+        try:
+            sampling_params.logits_processors = logits_processors
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="This vLLM build does not support logits_processors on SamplingParams. Upgrade vLLM to use format enforcement.",
+            )
+
     return sampling_params
 
 
@@ -417,6 +420,7 @@ async def run_inference(
     async for ro in agen:
         final_output = ro
     return final_output
+
 
 # =========================
 # Explicit Batch API
@@ -443,18 +447,20 @@ async def generate_batch(
             messages.append({"role": "user", "content": request.prompt})
             try:
                 prompt_text = tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
+                    messages,
+                    tokenize=False,
                     add_generation_prompt=True,
-                    enable_thinking=False
+                    enable_thinking=False,
                 )
             except Exception as e:
                 print(
                     f"Error applying chat template (idx={i}): {e}. Falling back to raw prompt."
                 )
                 prompt_text = request.prompt
+
             sampling_params = _create_sampling_params(request)
             tasks.append(run_inference(prompt_text, sampling_params))
+
         except Exception as e:
             detail = str(e.detail) if isinstance(e, HTTPException) else str(e)
             print(f"Error preparing request index {i}: {detail}")
@@ -521,10 +527,10 @@ async def chat_completions(
     # 3) Apply chat template (fallback to last user message)
     try:
         prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
+            messages,
+            tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False
+            enable_thinking=False,
         )
     except Exception as e:
         print(f"Error applying chat template: {e}. Messages: {messages}")
@@ -574,3 +580,8 @@ async def chat_completions(
         },
     }
     return resp
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8010")))
