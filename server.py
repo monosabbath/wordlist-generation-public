@@ -94,7 +94,7 @@ text_gen_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    device=model.device,
+    # device=model.device,  <-- THIS LINE IS REMOVED TO FIX ACCELERATE ERROR
     trust_remote_code=TRUST_REMOTE_CODE,
 )
 print("Pipeline created.")
@@ -432,7 +432,6 @@ def process_batch_job(
             pad_token_id=tokenizer.pad_token_id,
         )
 
-        # --- UPDATED BLOCK ---
         # Build prefix function if vocab is constrained
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
@@ -445,7 +444,6 @@ def process_batch_job(
             else:
                 # Vocab file was missing or empty, fail the job
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
-        # --- END OF UPDATED BLOCK ---
 
 
         # 4. Run the pipeline!
@@ -534,7 +532,6 @@ def create_batch_job(
         "num_beams": num_beams,
         "repetition_penalty": repetition_penalty,
         "length_penalty": length_penalty,
-        # --- ADDED THESE PARAMETERS ---
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
     }
