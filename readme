@@ -7,3 +7,41 @@ POST /v1/batch/jobs: You upload your JSON file (which should contain a list of C
 GET /v1/batch/jobs/{job_id}: You use this to check the status ("pending", "processing", "completed", or "failed").
 
 GET /v1/batch/jobs/{job_id}/results: Once the status is "completed", you call this to download the final JSON response file.
+
+
+Example File (my_requests.json):
+JSON
+
+[
+  {
+    "model": "your-model-name",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful assistant."
+      },
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ]
+  },
+  {
+    "model": "your-model-name",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Translate 'hello world' to Spanish."
+      }
+    ]
+  },
+  {
+    "model": "your-model-name",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ]
+  }
+]
