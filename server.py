@@ -1,12 +1,12 @@
 import os
 import time
 import uuid
-import json  # NEW: For reading/writing job files
-import tempfile  # NEW: For handling temp file locations
+import json  # For reading/writing job files
+import tempfile  # For handling temp file locations
 from functools import cache
 from typing import Literal, Optional, Dict, Any
 import torch
-from fastapi import (  # NEW: Added background tasks and file handling
+from fastapi import (  # Added background tasks and file handling
     Depends,
     FastAPI,
     HTTPException,
@@ -16,7 +16,7 @@ from fastapi import (  # NEW: Added background tasks and file handling
     File,
     BackgroundTasks,
 )
-from fastapi.responses import FileResponse  # NEW: To send the JSON file back
+from fastapi.responses import FileResponse  # To send the JSON file back
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
@@ -30,7 +30,7 @@ from lmformatenforcer.integrations.transformers import (
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    pipeline,  # NEW: Import the pipeline
+    pipeline,  # Import the pipeline
 )
 
 # Assuming 'common.py' contains GenerateRequest. If not, define a placeholder.
@@ -64,7 +64,7 @@ PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
 
-# NEW: Config for Batch Jobs
+# Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
 print(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
@@ -86,10 +86,9 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 
 # -----------------------
-# NEW: Create the generation pipeline
+# Create the generation pipeline
 # -----------------------
 # We create the pipeline using the already-loaded model and tokenizer
-# This saves memory and re-uses the exact components from your /v1/chat endpoint
 print("Creating text-generation pipeline...")
 text_gen_pipeline = pipeline(
     "text-generation",
@@ -104,7 +103,7 @@ print("Pipeline created.")
 # -----------------------
 # Helpers for stop tokens
 # -----------------------
-@cache  # NEW: Cache this function call
+@cache  # Cache this function call
 def get_stop_ids(tok: AutoTokenizer) -> list[int]:
     stop_ids: list[int] = []
     
@@ -347,14 +346,14 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
 
 # ---------------------------------------------------
-# NEW: BATCH JOB API
+# BATCH JOB API
 # ---------------------------------------------------
 
-# NEW: In-memory store for job statuses.
+# In-memory store for job statuses.
 # For production, you would replace this with Redis, a database, or similar.
 JOB_STATUS: Dict[str, Dict[str, Any]] = {}
 
-# NEW: The background worker function
+# The background worker function
 def process_batch_job(
     job_id: str,
     input_path: str,
@@ -415,7 +414,6 @@ def process_batch_job(
                 print(f"[Job {job_id}] Skipping request {i}: Error processing. {e}")
         
         # 3. Prepare shared generation kwargs for the *entire* batch job
-        # Note: We use the job-level config, not per-request config, for batching.
         stop_ids = get_stop_ids(tokenizer)
         
         # We need to set eos_token_id and pad_token_id for the pipeline
@@ -434,16 +432,30 @@ def process_batch_job(
             pad_token_id=tokenizer.pad_token_id,
         )
 
+        # --- UPDATED BLOCK ---
+        # Build prefix function if vocab is constrained
+        vocab_lang = job_config.get("vocab_lang")
+        vocab_n_words = job_config.get("vocab_n_words")
+        if vocab_lang and vocab_n_words:
+            print(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
+            prefix_fn = build_regexp_prefix_fn(vocab_lang, vocab_n_words)
+            if prefix_fn:
+                generation_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+                print(f"[Job {job_id}] Successfully added prefix function.")
+            else:
+                # Vocab file was missing or empty, fail the job
+                raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
+        # --- END OF UPDATED BLOCK ---
+
+
         # 4. Run the pipeline!
-        # This will automatically batch the `prompts` list,
-        # send them to the GPU, and decode the results.
         print(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
         results = []
         for output in text_gen_pipeline(
             prompts,
             batch_size=BATCH_JOB_PIPELINE_SIZE,
             return_full_text=False,  # <-- IMPORTANT: Only get the *new* text
-            **generation_kwargs,
+            **generation_kwargs, # This will now include prefix_fn
         ):
             # output is like [{'generated_text': '...'}]
             results.append(output[0]["generated_text"])
@@ -465,8 +477,6 @@ def process_batch_job(
                         "finish_reason": "stop",
                     }
                 ],
-                # Note: Token usage is complex to calculate in batches
-                # without re-tokenizing. We omit it for simplicity.
                 "usage": {
                     "prompt_tokens": None,
                     "completion_tokens": None,
@@ -488,7 +498,7 @@ def process_batch_job(
         JOB_STATUS[job_id]["error"] = str(e)
 
 
-# NEW: Endpoint 1: Submit a new batch job
+# Endpoint 1: Submit a new batch job
 @app.post("/v1/batch/jobs")
 def create_batch_job(
     background_tasks: BackgroundTasks,
@@ -501,6 +511,9 @@ def create_batch_job(
     num_beams: int = 1,
     repetition_penalty: float = 1.0,
     length_penalty: float = 1.0,
+    # --- ADDED THESE PARAMETERS ---
+    vocab_lang: Optional[Literal["en", "es"]] = None,
+    vocab_n_words: Optional[int] = None,
 ):
     job_id = str(uuid.uuid4())
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
@@ -521,6 +534,9 @@ def create_batch_job(
         "num_beams": num_beams,
         "repetition_penalty": repetition_penalty,
         "length_penalty": length_penalty,
+        # --- ADDED THESE PARAMETERS ---
+        "vocab_lang": vocab_lang,
+        "vocab_n_words": vocab_n_words,
     }
 
     # 3. Register the job
@@ -545,7 +561,7 @@ def create_batch_job(
     }
 
 
-# NEW: Endpoint 2: Check job status
+# Endpoint 2: Check job status
 @app.get("/v1/batch/jobs/{job_id}")
 def get_batch_job_status(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
@@ -561,7 +577,7 @@ def get_batch_job_status(job_id: str, auth_ok: bool = Depends(verify_token)):
     }
 
 
-# NEW: Endpoint 3: Get job results
+# Endpoint 3: Get job results
 @app.get("/v1/batch/jobs/{job_id}/results")
 def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
