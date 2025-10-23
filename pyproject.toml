@@ -1,23 +1,23 @@
 [project]
 name = "wordlist-generation"
-version = "0.2.0"
-description = "Constrained generation proxy using vLLM OpenAI server + LM Format Enforcer (guided decoding)"
+version = "0.1.0"
+description = "Constrained generation server using vLLM OpenAI server + LM Format Enforcer (proxied by FastAPI)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "click",
     "fastapi[standard]",
     "httpx",
     "lm-format-enforcer",
-    "pydantic>=2",
+    "openai>=1.0.0",
+    "pydantic",
+    "transformers",
     "python-dotenv",
-    "vllm",            # required for running the vLLM OpenAI server
-    # "transformers",  # not required by this proxy anymore; uncomment if you still need it elsewhere
+    "vllm",
 ]
-
 [dependency-groups]
 dev = [
     "ruff",
 ]
-
 [tool.setuptools]
 py-modules = ["client", "common", "server"]
