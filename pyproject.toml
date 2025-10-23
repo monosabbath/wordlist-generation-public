@@ -21,6 +21,8 @@ dependencies = [
     "tiktoken",
     # ADDED: High-performance event loop seen in traceback
     "uvloop",
+    # ADDED: Required for FP8 models like zai-org/GLM-4.6-FP8
+    "compressed-tensors",
 ]
 
 [dependency-groups]
