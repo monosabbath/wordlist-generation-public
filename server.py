@@ -7,9 +7,11 @@ import re
 import time
 import uuid
 import asyncio
-import signal
 import subprocess
-from typing import Literal, Optional, List, Dict, Any
+import signal
+import sys
+from contextlib import asynccontextmanager
+from typing import Literal, Optional, List, Any, Dict
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
@@ -25,8 +27,8 @@ except ImportError:
     class GenerateRequest(BaseModel):
         prompt: str
         max_new_tokens: int = 100
-        repetition_penalty: Optional[float] = 1.0  # not used by vLLM OpenAI API
-        length_penalty: Optional[float] = 1.0      # not used by vLLM OpenAI API
+        repetition_penalty: Optional[float] = 1.0
+        length_penalty: Optional[float] = 1.0
         num_beams: Optional[int] = 1
         vocab_lang: Optional[Literal["en", "es"]] = None
         vocab_n_words: Optional[int] = None
@@ -34,48 +36,47 @@ except ImportError:
 # =========================
 # FastAPI app
 # =========================
-app = FastAPI()
+# We will start the vLLM OpenAI server as a background subprocess during lifespan.
+# All requests will be proxied to that server to use LMFE via guided_regex.
+# This preserves your existing simple launch commands.
+vllm_process: Optional[subprocess.Popen] = None
+http_client: Optional[httpx.AsyncClient] = None
+
+# App will be created at the end after defining lifespan
+app: FastAPI
 
 # =========================
 # Config via environment
 # =========================
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
 
-# vLLM server spawn / connection
-START_VLLM_SERVER = os.getenv("START_VLLM_SERVER", "true").lower() == "true"
-VLLM_HOST = os.getenv("VLLM_HOST", "127.0.0.1")
-VLLM_PORT = int(os.getenv("VLLM_PORT", "8011"))
-VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}"
-
-# vLLM engine args
 DTYPE_STR = os.getenv("TORCH_DTYPE", "auto").lower()
+QUANTIZATION = os.getenv("QUANTIZATION", None)
 TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", 1))
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", 0.90))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", 0))
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 
-# HF tokens and cache
-HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-HF_HOME = os.getenv("HF_HOME", None)
-
-# Auth for this proxy server
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
-
-# Default system prompts
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
 
-# Prebuild constrained vocab regex parsers at startup
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
 
-# Optional: server-level guided decoding backend (we still set per-request too)
-GUIDED_DECODING_BACKEND = os.getenv("GUIDED_DECODING_BACKEND", "lm-format-enforcer")
+# Optional HF token for gated models/tokenizers
+HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+
+# vLLM OpenAI server runtime
+VLLM_HOST = os.getenv("VLLM_HOST", "127.0.0.1")
+VLLM_PORT = int(os.getenv("VLLM_PORT", "8011"))
+LAUNCH_VLLM_SERVER = os.getenv("LAUNCH_VLLM_SERVER", "true").lower() == "true"
+VLLM_LOG_LEVEL = os.getenv("VLLM_LOG_LEVEL", "info")
 
 # =========================
-# Wordlist-based Regex Builder (no LMFE import required)
+# Wordlist-based regex builder (no LMFE objects here)
 # =========================
 def _here_file(*parts: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
@@ -89,33 +90,33 @@ def _load_words(lang: Literal["en", "es"], n_words: int) -> list[str]:
         words = [w.strip() for w in fin if w.strip()]
     return words[:n_words]
 
-# Simple cache for patterns
-_regex_cache: Dict[tuple[str, int], Optional[str]] = {}
+try:
+    from functools import cache
+except ImportError:
+    from functools import lru_cache as cache
 
-def get_cached_wordlist_regex(
-    lang: Optional[Literal["en", "es"]],
-    n_words: Optional[int],
+@cache
+def get_cached_regex_pattern(
+    lang: Literal["en", "es"], n_words: int
 ) -> Optional[str]:
     """
-    Build a case-flexible wordlist regex with optional punctuation between words.
+    Build a case-flexible wordlist regex with optional leading/trailing punctuation and separators.
     Grammar (prefix-friendly):
       (SEP)? (WORD) (SEP WORD)* (SEP)?
+    where:
+      WORD matches any word from the list with only the initial letter case-insensitive.
+      SEP  matches punctuation/whitespace between words.
+    Note: ^ and $ anchors are avoided for prefix-friendly decoding.
     """
-    if not (lang and n_words):
-        return None
-    key = (lang, n_words)
-    if key in _regex_cache:
-        return _regex_cache[key]
     try:
         words = _load_words(lang, n_words)
     except FileNotFoundError as e:
         print(str(e))
-        _regex_cache[key] = None
         return None
     if not words:
         print(f"Warning: {lang}.txt is empty or contains no valid words.")
-        _regex_cache[key] = None
         return None
+
     alts = []
     for w in words:
         if not w:
@@ -123,28 +124,22 @@ def get_cached_wordlist_regex(
         first = w[0]
         rest = w[1:]
         if first.isalpha():
-            # Build an alt where just the first letter is case-insensitive
             esc_rest = re.escape(rest)
             lc, uc = first.lower(), first.upper()
             alts.append(f"(?:[{lc}{uc}]{esc_rest})")
         else:
             alts.append(f"(?:{re.escape(w)})")
-    if not alts:
-        _regex_cache[key] = None
-        return None
     word_alt = "|".join(alts)
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
-    # No ^/$ anchors to keep it prefix-friendly for guided decoding
     pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
-    _regex_cache[key] = pattern
     return pattern
 
 if PREBUILD_PREFIX:
     print("Prebuilding regex patterns...")
-    for lang in ("es",):
-        for n in PREBUILD_WORD_COUNTS:
-            _ = get_cached_wordlist_regex(lang, n)
-    print("Done prebuilding patterns.")
+    for lang in ("es",):  # only Spanish prebuild as requested
+        for n_words in PREBUILD_WORD_COUNTS:
+            get_cached_regex_pattern(lang, n_words)
+    print("Done prebuilding.")
 
 # =========================
 # Auth helper
@@ -163,34 +158,40 @@ def verify_token(
     return True
 
 # =========================
-# Pydantic Models (OpenAI)
+# Pydantic Models (OpenAI-compatible)
 # =========================
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra='ignore')
+    # Allow extra keys to pass through if clients send them
+    model_config = ConfigDict(extra="allow")
     model: Optional[str] = None
-    messages: List[ChatMessage]
+    messages: list[ChatMessage]
     max_tokens: Optional[int] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
-    stop: Optional[List[str] | str] = None
+    stop: Optional[list[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
+    stream: Optional[bool] = False
     # Custom parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
-    early_stopping: Optional[bool] = None  # forwarded via extra_body
+    repetition_penalty: Optional[float] = None
+    length_penalty: Optional[float] = None
+    early_stopping: Optional[bool] = None
+    # vLLM OpenAI server accepts "extra_body" for sampling params and guided decoding
+    extra_body: Optional[dict] = None
 
 class BatchGenerateRequest(BaseModel):
     requests: List[GenerateRequest]
 
 # =========================
-# Utilities
+# Utility helpers
 # =========================
 def _normalize_stop(stop_in):
     if stop_in is None:
@@ -201,179 +202,218 @@ def _normalize_stop(stop_in):
     if isinstance(stop_in, list):
         out = [s for s in (x.strip() for x in stop_in) if s]
         return out or None
-    raise HTTPException(
-        status_code=400, detail="stop must be a string or a list of strings"
-    )
+    raise HTTPException(status_code=400, detail="stop must be a string or a list of strings")
 
-def _build_vllm_payload_for_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
-    # Beam search handling
-    num_beams = int(req.num_beams or 1)
-    use_beam_search = num_beams > 1
-    n = int(req.n or 1)
-    if use_beam_search and n > num_beams:
-        raise HTTPException(
-            status_code=400,
-            detail=f"n ({n}) cannot exceed num_beams ({num_beams}) when using beam search.",
-        )
+def _add_default_system_prompt(messages: list[ChatMessage], vocab_lang: Optional[str]) -> list[dict]:
+    has_system = any(m.role == "system" for m in messages)
+    # Choose default prompt based on vocab_lang if provided
+    default_system = DEFAULT_SYSTEM_PROMPT_ES if vocab_lang == "es" else DEFAULT_SYSTEM_PROMPT_EN
+    out: list[dict] = []
+    if not has_system and default_system != "":
+        out.append({"role": "system", "content": default_system})
+    for m in messages:
+        out.append({"role": m.role, "content": m.content})
+    return out
 
-    # Regex pattern from wordlist (if requested)
-    guided_regex = get_cached_wordlist_regex(req.vocab_lang, req.vocab_n_words)
-
-    # Temperature/top_p deterministic under beam search
-    temperature = 0.0 if use_beam_search else (req.temperature if req.temperature is not None else 1.0)
-    top_p = 1.0 if use_beam_search else (req.top_p if req.top_p is not None else 1.0)
-
-    payload: Dict[str, Any] = {
-        "model": req.model or MODEL_NAME,
-        "messages": [m.model_dump() for m in req.messages],
-        "max_tokens": req.max_tokens or 100,
-        "temperature": temperature,
-        "top_p": top_p,
-        "n": n,
-        "stop": _normalize_stop(req.stop),
-        "presence_penalty": req.presence_penalty if req.presence_penalty is not None else 0.0,
-        "frequency_penalty": req.frequency_penalty if req.frequency_penalty is not None else 0.0,
-        "extra_body": {
-            # Core: enable LMFE on vLLM server
-            "guided_decoding_backend": GUIDED_DECODING_BACKEND,
-            # Only include guided_regex if we actually built one
-            **({"guided_regex": guided_regex} if guided_regex else {}),
-            # Beam search extras for vLLM OpenAI server
-            **({"use_beam_search": True, "best_of": num_beams} if use_beam_search else {}),
-            # Optional early_stopping passthrough (vLLM accepts it in extra_body)
-            **({"early_stopping": req.early_stopping} if req.early_stopping is not None else {}),
-        },
-    }
-    return payload
-
-def _build_vllm_payload_for_prompt(
-    prompt: str,
-    max_new_tokens: int,
-    num_beams: int,
-    vocab_lang: Optional[Literal["en","es"]],
-    vocab_n_words: Optional[int],
-    system_msg_en: str,
-    system_msg_es: str,
+def _build_extra_body_for_request(
+    req: ChatCompletionRequest
 ) -> Dict[str, Any]:
-    messages = []
-    system_msg = system_msg_es if vocab_lang == "es" else system_msg_en
-    if system_msg != "":
-        messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": prompt})
+    extra = dict(req.extra_body or {})
 
-    req = ChatCompletionRequest(
-        model=MODEL_NAME,
-        messages=[ChatMessage(**m) for m in messages],
-        max_tokens=max_new_tokens,
-        num_beams=num_beams,
-        vocab_lang=vocab_lang,
-        vocab_n_words=vocab_n_words,
-        temperature=1.0,
-        top_p=1.0,
-        n=1,
-    )
-    return _build_vllm_payload_for_chat(req)
+    # Beam search mapping: vLLM requires use_beam_search=True and best_of=beam_width; n <= best_of
+    if req.num_beams and req.num_beams > 1:
+        beam_width = int(req.num_beams)
+        n_val = int(req.n or 1)
+        if n_val > beam_width:
+            raise HTTPException(
+                status_code=400,
+                detail=f"n ({n_val}) cannot exceed num_beams ({beam_width}) when using beam search."
+            )
+        extra["use_beam_search"] = True
+        extra["best_of"] = beam_width
+        # Encourage deterministic decoding under beam search:
+        # We'll also set temperature/top_p in the top-level payload accordingly.
+
+    # Penalties and others (vLLM OpenAI server forwards these into SamplingParams)
+    if req.repetition_penalty is not None:
+        extra["repetition_penalty"] = req.repetition_penalty
+    if req.length_penalty is not None:
+        extra["length_penalty"] = req.length_penalty
+    if req.early_stopping is not None:
+        extra["early_stopping"] = req.early_stopping
+    if req.presence_penalty is not None:
+        extra["presence_penalty"] = req.presence_penalty
+    if req.frequency_penalty is not None:
+        extra["frequency_penalty"] = req.frequency_penalty
+
+    # Guided decoding via regex if both params provided
+    if req.vocab_lang and req.vocab_n_words:
+        pattern = get_cached_regex_pattern(req.vocab_lang, req.vocab_n_words)
+        if pattern is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Dictionary file {req.vocab_lang}.txt not found or empty."
+            )
+        # Only set guided_regex if not already provided by caller
+        if "guided_regex" not in extra:
+            extra["guided_regex"] = pattern
+        # Ensure LMFE backend is selected
+        if "guided_decoding_backend" not in extra:
+            extra["guided_decoding_backend"] = "lm-format-enforcer"
+
+    return extra
 
 # =========================
-# vLLM server process management
+# vLLM OpenAI server management
 # =========================
-_vllm_proc: Optional[subprocess.Popen] = None
-_http_client: Optional[httpx.AsyncClient] = None
-
-async def _wait_for_vllm_ready(timeout_s: int = 180) -> None:
-    deadline = time.time() + timeout_s
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        while time.time() < deadline:
-            try:
-                r = await client.get(f"{VLLM_BASE_URL}/v1/models")
-                if r.status_code == 200:
-                    return
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-    raise RuntimeError("Timed out waiting for vLLM OpenAI server to become ready.")
-
-def _spawn_vllm_server():
-    global _vllm_proc
-    if _vllm_proc is not None and _vllm_proc.poll() is None:
-        return  # already running
-
+def _build_vllm_server_cmd() -> list[str]:
     cmd = [
-        "python",
+        sys.executable,
         "-m",
         "vllm.entrypoints.openai.api_server",
-        "--model", MODEL_NAME,
-        "--host", VLLM_HOST,
-        "--port", str(VLLM_PORT),
-        "--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE),
-        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
-        "--guided-decoding-backend", GUIDED_DECODING_BACKEND,
+        "--model",
+        MODEL_NAME,
+        "--host",
+        VLLM_HOST,
+        "--port",
+        str(VLLM_PORT),
+        "--log-level",
+        VLLM_LOG_LEVEL,
+        "--guided-decoding-backend",
+        "lm-format-enforcer",
     ]
-    if TRUST_REMOTE_CODE:
-        cmd += ["--trust-remote-code"]
+    if TENSOR_PARALLEL_SIZE and TENSOR_PARALLEL_SIZE > 1:
+        cmd += ["--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE)]
     if DTYPE_STR:
         cmd += ["--dtype", DTYPE_STR]
-    if MAX_MODEL_LEN > 0:
+    if QUANTIZATION:
+        cmd += ["--quantization", QUANTIZATION]
+    if GPU_MEMORY_UTILIZATION is not None:
+        cmd += ["--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION)]
+    if MAX_MODEL_LEN and MAX_MODEL_LEN > 0:
         cmd += ["--max-model-len", str(MAX_MODEL_LEN)]
-    if HF_HOME:
-        cmd += ["--download-dir", HF_HOME]
-    # Helpful for UI testing across origins
-    cmd += ["--cors-origins", "*"]
+    if TRUST_REMOTE_CODE:
+        cmd += ["--trust-remote-code"]
+    # Optional: override served-model-name if you want a friendly name
+    # cmd += ["--served-model-name", MODEL_NAME]
+    return cmd
 
-    env = os.environ.copy()
-    if HF_TOKEN:
-        env["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
-
-    print("Starting vLLM OpenAI server:", " ".join(cmd))
-    _vllm_proc = subprocess.Popen(
-        cmd,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-@app.on_event("startup")
-async def on_startup():
-    global _http_client
-    if START_VLLM_SERVER:
-        _spawn_vllm_server()
-        # Wait for readiness
-        await _wait_for_vllm_ready()
-        print(f"vLLM OpenAI server ready at {VLLM_BASE_URL}")
-    _http_client = httpx.AsyncClient(base_url=VLLM_BASE_URL, timeout=120.0)
-
-@app.on_event("shutdown")
-async def on_shutdown():
-    global _http_client, _vllm_proc
-    if _http_client:
-        await _http_client.aclose()
-        _http_client = None
-    if _vllm_proc and _vllm_proc.poll() is None:
-        print("Stopping vLLM OpenAI server...")
+async def _wait_for_vllm_ready(timeout_s: float = 180.0) -> None:
+    global http_client
+    start = time.monotonic()
+    url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models"
+    # Create a short-lived client if not yet created
+    local_client = http_client or httpx.AsyncClient(timeout=10.0)
+    while True:
         try:
-            _vllm_proc.send_signal(signal.SIGTERM)
-            try:
-                _vllm_proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                _vllm_proc.kill()
+            resp = await local_client.get(url)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "data" in data:
+                    return
         except Exception:
             pass
-        _vllm_proc = None
+        if time.monotonic() - start > timeout_s:
+            raise RuntimeError("Timed out waiting for vLLM OpenAI server to become ready.")
+        await asyncio.sleep(0.5)
+    # no return — loop exits either on return above or exception due to timeout
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    global vllm_process, http_client
+    # Start vLLM OpenAI server as a background subprocess (if enabled)
+    env = dict(os.environ)
+    if LAUNCH_VLLM_SERVER:
+        cmd = _build_vllm_server_cmd()
+        print(f"Launching vLLM OpenAI server: {' '.join(cmd)}")
+        vllm_process = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
+        )
+        try:
+            # Wait for vLLM server readiness
+            await _wait_for_vllm_ready()
+            print("vLLM OpenAI server is ready.")
+        except Exception as e:
+            print(f"CRITICAL: vLLM OpenAI server did not become ready: {e}")
+            # If it cannot start, stop the process and raise
+            if vllm_process and vllm_process.poll() is None:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(os.getpgid(vllm_process.pid), signal.SIGTERM)
+                    else:
+                        vllm_process.terminate()
+                except Exception:
+                    pass
+            raise
+
+    # Create a shared HTTP client for proxying requests
+    http_client = httpx.AsyncClient(timeout=60.0)
+
+    try:
+        yield
+    finally:
+        # Close HTTP client
+        if http_client:
+            try:
+                await http_client.aclose()
+            except Exception:
+                pass
+        # Stop vLLM server
+        if vllm_process and vllm_process.poll() is None:
+            print("Shutting down vLLM OpenAI server...")
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(vllm_process.pid), signal.SIGTERM)
+                else:
+                    vllm_process.terminate()
+                try:
+                    vllm_process.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    print("vLLM server did not exit in time; killing.")
+                    vllm_process.kill()
+            except Exception as e:
+                print(f"Error while shutting down vLLM server: {e}")
+
+# Initialize FastAPI with lifespan
+app = FastAPI(lifespan=lifespan)
 
 # =========================
-# Proxy helpers
+# HTTP proxy helpers
 # =========================
-async def _post_vllm(path: str, json: Dict[str, Any]) -> httpx.Response:
-    if not _http_client:
-        raise HTTPException(status_code=500, detail="HTTP client not initialized")
-    return await _http_client.post(path, json=json)
+async def _vllm_chat_completions_proxy(payload: dict) -> dict:
+    """
+    Sends the given OpenAI Chat Completions payload to the local vLLM OpenAI server
+    and returns its JSON response.
+    """
+    global http_client
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized.")
+    url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/chat/completions"
+    try:
+        resp = await http_client.post(url, json=payload)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach vLLM server: {e}")
+    if resp.status_code != 200:
+        detail = resp.text
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    return resp.json()
 
-async def _get_vllm(path: str) -> httpx.Response:
-    if not _http_client:
-        raise HTTPException(status_code=500, detail="HTTP client not initialized")
-    return await _http_client.get(path)
+async def _vllm_list_models_proxy() -> dict:
+    global http_client
+    if http_client is None:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized.")
+    url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models"
+    try:
+        resp = await http_client.get(url)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Failed to reach vLLM server: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 # =========================
 # Legacy constrained API
@@ -382,27 +422,46 @@ async def _get_vllm(path: str) -> httpx.Response:
 async def generate(
     request: GenerateRequest, auth_ok: bool = Depends(verify_token)
 ) -> str:
+    # Build messages (system prompt can be selected by vocab_lang)
+    system_msg = DEFAULT_SYSTEM_PROMPT_ES if request.vocab_lang == "es" else DEFAULT_SYSTEM_PROMPT_EN
+    messages = []
+    if system_msg != "":
+        messages.append({"role": "system", "content": system_msg})
+    messages.append({"role": "user", "content": request.prompt})
+
+    # Build extra_body for guided regex + penalties + beam
+    fake_req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[ChatMessage(role=m["role"], content=m["content"]) for m in messages],
+        max_tokens=request.max_new_tokens,
+        temperature=0.0 if (request.num_beams and request.num_beams > 1) else 1.0,
+        top_p=1.0,
+        n=1,
+        stop=None,
+        vocab_lang=request.vocab_lang,
+        vocab_n_words=request.vocab_n_words,
+        num_beams=int(request.num_beams or 1),
+        repetition_penalty=request.repetition_penalty,
+        length_penalty=request.length_penalty,
+    )
+    extra_body = _build_extra_body_for_request(fake_req)
+
+    # Prepare payload for vLLM OpenAI server
+    payload = {
+        "model": MODEL_NAME,
+        "messages": messages,
+        "max_tokens": request.max_new_tokens,
+        "temperature": 0.0 if (request.num_beams and request.num_beams > 1) else 1.0,
+        "top_p": 1.0 if (request.num_beams and request.num_beams > 1) else 1.0,
+        "n": 1,
+        "extra_body": extra_body,
+    }
+
+    data = await _vllm_chat_completions_proxy(payload)
     try:
-        payload = _build_vllm_payload_for_prompt(
-            prompt=request.prompt,
-            max_new_tokens=request.max_new_tokens,
-            num_beams=int(request.num_beams or 1),
-            vocab_lang=request.vocab_lang,
-            vocab_n_words=request.vocab_n_words,
-            system_msg_en=DEFAULT_SYSTEM_PROMPT_EN,
-            system_msg_es=DEFAULT_SYSTEM_PROMPT_ES,
-        )
-        r = await _post_vllm("/v1/chat/completions", payload)
-        if r.status_code != 200:
-            raise HTTPException(status_code=r.status_code, detail=r.text)
-        data = r.json()
-        if data.get("choices"):
-            return data["choices"][0]["message"]["content"]
+        return data["choices"][0]["message"]["content"]
+    except Exception:
         return ""
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
 # Explicit Batch API
@@ -411,71 +470,93 @@ async def generate(
 async def generate_batch(
     batch_request: BatchGenerateRequest, auth_ok: bool = Depends(verify_token)
 ):
-    tasks = []
-    for i, request in enumerate(batch_request.requests):
-        payload = _build_vllm_payload_for_prompt(
-            prompt=request.prompt,
-            max_new_tokens=request.max_new_tokens,
-            num_beams=int(request.num_beams or 1),
-            vocab_lang=request.vocab_lang,
-            vocab_n_words=request.vocab_n_words,
-            system_msg_en=DEFAULT_SYSTEM_PROMPT_EN,
-            system_msg_es=DEFAULT_SYSTEM_PROMPT_ES,
-        )
-        tasks.append(_post_vllm("/v1/chat/completions", payload))
+    async def _one(req: GenerateRequest):
+        try:
+            system_msg = DEFAULT_SYSTEM_PROMPT_ES if req.vocab_lang == "es" else DEFAULT_SYSTEM_PROMPT_EN
+            messages = []
+            if system_msg != "":
+                messages.append({"role": "system", "content": system_msg})
+            messages.append({"role": "user", "content": req.prompt})
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    outputs = []
-    for r in results:
-        if isinstance(r, Exception):
-            outputs.append({"success": False, "error": str(r), "text": None})
-        else:
-            try:
-                data = r.json()
-                if r.status_code != 200:
-                    outputs.append({"success": False, "error": r.text, "text": None})
-                elif data.get("choices"):
-                    outputs.append({"success": True, "error": None, "text": data["choices"][0]["message"]["content"]})
-                else:
-                    outputs.append({"success": True, "error": "Generation produced no output.", "text": ""})
-            except Exception as e:
-                outputs.append({"success": False, "error": str(e), "text": None})
-    return {"results": outputs}
+            fake_req = ChatCompletionRequest(
+                model=MODEL_NAME,
+                messages=[ChatMessage(role=m["role"], content=m["content"]) for m in messages],
+                max_tokens=req.max_new_tokens,
+                temperature=0.0 if (req.num_beams and req.num_beams > 1) else 1.0,
+                top_p=1.0,
+                n=1,
+                stop=None,
+                vocab_lang=req.vocab_lang,
+                vocab_n_words=req.vocab_n_words,
+                num_beams=int(req.num_beams or 1),
+                repetition_penalty=req.repetition_penalty,
+                length_penalty=req.length_penalty,
+            )
+            extra_body = _build_extra_body_for_request(fake_req)
+
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "max_tokens": req.max_new_tokens,
+                "temperature": 0.0 if (req.num_beams and req.num_beams > 1) else 1.0,
+                "top_p": 1.0 if (req.num_beams and req.num_beams > 1) else 1.0,
+                "n": 1,
+                "extra_body": extra_body,
+            }
+            data = await _vllm_chat_completions_proxy(payload)
+            text = data["choices"][0]["message"]["content"]
+            return {"success": True, "error": None, "text": text}
+        except HTTPException as he:
+            return {"success": False, "error": str(he.detail), "text": None}
+        except Exception as e:
+            return {"success": False, "error": str(e), "text": None}
+
+    tasks = [asyncio.create_task(_one(r)) for r in batch_request.requests]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return {"results": results}
 
 # =========================
-# OpenAI-compatible API (proxied)
+# OpenAI-compatible API (proxied to vLLM server with guided decoding)
 # =========================
 @app.get("/v1/models")
 async def list_models(auth_ok: bool = Depends(verify_token)):
-    # Prefer to proxy vLLM for exact metadata
-    try:
-        r = await _get_vllm("/v1/models")
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    # Fallback minimal response
-    return {
-        "object": "list",
-        "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "owner"}],
-    }
+    # Pass-through to the vLLM server
+    return await _vllm_list_models_proxy()
 
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)
 ):
-    # 1) Ensure a system prompt if none supplied and env default exists
-    has_system = any(m.role == "system" for m in req.messages)
-    if not has_system:
-        system_prompt = DEFAULT_SYSTEM_PROMPT_EN
-        if system_prompt != "":
-            req.messages = [ChatMessage(role="system", content=system_prompt)] + req.messages
+    # Ensure messages include default system prompt if none was provided
+    messages_out = _add_default_system_prompt(req.messages, req.vocab_lang)
 
-    # 2) Build vLLM payload (adds guided_regex + beam search in extra_body)
-    payload = _build_vllm_payload_for_chat(req)
+    # Merge extra_body with guided decoding/beam/penalties logic
+    extra_body = _build_extra_body_for_request(req)
 
-    # 3) Proxy to vLLM OpenAI server
-    r = await _post_vllm("/v1/chat/completions", payload)
-    if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=r.text)
-    return r.json()
+    # Beam search implies deterministic sampling
+    use_beam = bool(req.num_beams and req.num_beams > 1)
+    temperature = 0.0 if use_beam else (req.temperature if req.temperature is not None else 1.0)
+    top_p = 1.0 if use_beam else (req.top_p if req.top_p is not None else 1.0)
+
+    # n cannot exceed best_of when beam search is enabled (already enforced in _build_extra_body_for_request)
+    n_val = int(req.n or 1)
+
+    # Prepare payload to vLLM OpenAI server
+    payload = {
+        "model": req.model or MODEL_NAME,
+        "messages": messages_out,
+        "max_tokens": req.max_tokens or 100,
+        "temperature": temperature,
+        "top_p": top_p,
+        "n": n_val,
+        "stop": _normalize_stop(req.stop),
+        # Pass extra params into SamplingParams via extra_body
+        "extra_body": extra_body,
+        # We disable streaming passthrough in this proxy for simplicity.
+        # If a client sets stream=True, you can either reject or convert to non-stream here.
+        "stream": False,
+    }
+
+    data = await _vllm_chat_completions_proxy(payload)
+    # Pass through vLLM response unchanged for maximum OpenAI compatibility
+    return data
