@@ -418,40 +418,6 @@ async def run_inference(
         final_output = ro
     return final_output
 
-
-# =========================
-# Legacy constrained API
-# =========================
-@app.post("/generate")
-async def generate(
-    request: GenerateRequest, auth_ok: bool = Depends(verify_token)
-) -> str:
-    system_msg = (
-        DEFAULT_SYSTEM_PROMPT_ES if request.vocab_lang == "es" else DEFAULT_SYSTEM_PROMPT_EN
-    )
-    messages = []
-    if system_msg != "":
-        messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": request.prompt})
-    # Apply chat template, with a fallback to raw prompt
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-    except Exception as e:
-        print(f"Error applying chat template: {e}. Falling back to raw prompt.")
-        prompt_text = request.prompt
-
-    sampling_params = _create_sampling_params(request)
-    final_output = await run_inference(prompt_text, sampling_params)
-    if final_output and final_output.outputs:
-        return final_output.outputs[0].text
-    return ""
-
-
 # =========================
 # Explicit Batch API
 # =========================
