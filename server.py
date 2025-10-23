@@ -276,9 +276,21 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
+    # --- START: Conditional chat_template_kwargs ---
+    template_kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True
+    }
+
+    # Conditionally add the 'thinking' parameter ONLY for the specific GLM model
+    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
+        print("Applying 'enable_thinking: False' for GLM-4.6-FP8.")
+        template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+
     texts = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+        messages, **template_kwargs
     )
+    # --- END: Conditional chat_template_kwargs ---
     
     # CHANGE 3.1: Truncate prompt to 1024 tokens to manage KV cache
     inputs = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
