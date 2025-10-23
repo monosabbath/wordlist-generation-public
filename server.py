@@ -286,72 +286,8 @@ def _get_gen_kwargs(
             gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
     return gen_kwargs
 
-
 # -----------------------
-# Legacy constrained API
-# -----------------------
-@app.post("/generate")
-def generate(request: GenerateRequest, auth_ok: bool = Depends(verify_token)) -> str:
-    system_msg = (
-        DEFAULT_SYSTEM_PROMPT_ES
-        if request.vocab_lang == "es"
-        else DEFAULT_SYSTEM_PROMPT_EN
-    )
-    messages = []
-    if system_msg != "":
-        messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": request.prompt})
-
-    # Apply chat template (ChatML-compatible for Kimi-K2)
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    # Truncate prompt to MAX_TOTAL_TOKENS to reduce KV/VRAM
-    inputs = tokenizer(
-        text, return_tensors="pt", max_length=MAX_TOTAL_TOKENS, truncation=True
-    ).to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
-    # Calculate max_new_tokens to respect the total token cap
-    max_new_from_request = request.max_new_tokens
-    allowed_new_tokens = max(0, MAX_TOTAL_TOKENS - input_len)
-    if allowed_new_tokens <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No room for generation: input reached MAX_TOTAL_TOKENS. Reduce prompt length or increase MAX_TOTAL_TOKENS.",
-        )
-    max_new_tokens = min(max_new_from_request, allowed_new_tokens)
-
-    prefix_fn = build_regexp_prefix_fn(request.vocab_lang, request.vocab_n_words)
-    if prefix_fn is None:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Constrained vocabulary configuration failed for language '{request.vocab_lang}'. Check server logs for missing/empty .txt files.",
-        )
-
-    stop_ids = get_stop_ids(tokenizer)
-
-    gen_kwargs = _get_gen_kwargs(
-        max_new_tokens=max_new_tokens,
-        stop_ids=stop_ids,
-        temperature=1.0,  # Keep legacy behavior deterministic-ish
-        num_beams=request.num_beams,
-        repetition_penalty=request.repetition_penalty,
-        length_penalty=request.length_penalty,
-        prefix_fn=prefix_fn,
-    )
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **inputs,
-            **gen_kwargs,
-        )
-    result = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
-    return result
-
-
-# -----------------------
-# OpenAI-compatible API (optional but useful)
+# OpenAI-compatible API
 # -----------------------
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
