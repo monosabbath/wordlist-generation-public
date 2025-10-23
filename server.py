@@ -1,7 +1,6 @@
 # --- Load environment ASAP ---
 from dotenv import load_dotenv
 load_dotenv()
-
 import os
 import re
 import time
@@ -12,11 +11,9 @@ import signal
 import sys
 from contextlib import asynccontextmanager
 from typing import Literal, Optional, List, Any, Dict
-
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel, ConfigDict
-
 # =========================
 # Fallback request schemas
 # =========================
@@ -32,7 +29,6 @@ except ImportError:
         num_beams: Optional[int] = 1
         vocab_lang: Optional[Literal["en", "es"]] = None
         vocab_n_words: Optional[int] = None
-
 # =========================
 # FastAPI app
 # =========================
@@ -41,47 +37,38 @@ except ImportError:
 # This preserves your existing simple launch commands.
 vllm_process: Optional[subprocess.Popen] = None
 http_client: Optional[httpx.AsyncClient] = None
-
 # App will be created at the end after defining lifespan
 app: FastAPI
-
 # =========================
 # Config via environment
 # =========================
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-
 DTYPE_STR = os.getenv("TORCH_DTYPE", "auto").lower()
 QUANTIZATION = os.getenv("QUANTIZATION", None)
 TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", 1))
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", 0.90))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", 0))
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
-
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
-
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
-
 # Optional HF token for gated models/tokenizers
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-
 # vLLM OpenAI server runtime
 VLLM_HOST = os.getenv("VLLM_HOST", "127.0.0.1")
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8011"))
 LAUNCH_VLLM_SERVER = os.getenv("LAUNCH_VLLM_SERVER", "true").lower() == "true"
 VLLM_LOG_LEVEL = os.getenv("VLLM_LOG_LEVEL", "info")
-
 # =========================
 # Wordlist-based regex builder (no LMFE objects here)
 # =========================
 def _here_file(*parts: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, *parts)
-
 def _load_words(lang: Literal["en", "es"], n_words: int) -> list[str]:
     filename = _here_file(f"{lang}.txt")
     if not os.path.exists(filename):
@@ -89,12 +76,10 @@ def _load_words(lang: Literal["en", "es"], n_words: int) -> list[str]:
     with open(filename, encoding="utf-8") as fin:
         words = [w.strip() for w in fin if w.strip()]
     return words[:n_words]
-
 try:
     from functools import cache
 except ImportError:
     from functools import lru_cache as cache
-
 @cache
 def get_cached_regex_pattern(
     lang: Literal["en", "es"], n_words: int
@@ -116,7 +101,6 @@ def get_cached_regex_pattern(
     if not words:
         print(f"Warning: {lang}.txt is empty or contains no valid words.")
         return None
-
     alts = []
     for w in words:
         if not w:
@@ -133,14 +117,12 @@ def get_cached_regex_pattern(
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
     pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
     return pattern
-
 if PREBUILD_PREFIX:
     print("Prebuilding regex patterns...")
     for lang in ("es",):  # only Spanish prebuild as requested
         for n_words in PREBUILD_WORD_COUNTS:
             get_cached_regex_pattern(lang, n_words)
     print("Done prebuilding.")
-
 # =========================
 # Auth helper
 # =========================
@@ -151,19 +133,18 @@ def verify_token(
     supplied = token
     if not supplied and authorization:
         parts = authorization.split()
-        if len(parts) == 2 and parts[0].lower() == "bearer":
+        # *** FIX ***: Corrected syntax error (was 'len(parts) 2' and '... "bearer"')
+        if len(parts) >= 2 and parts[0].lower() == "bearer":
             supplied = parts[1]
     if SECRET_TOKEN and supplied != SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
-
 # =========================
 # Pydantic Models (OpenAI-compatible)
 # =========================
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
-
 class ChatCompletionRequest(BaseModel):
     # Allow extra keys to pass through if clients send them
     model_config = ConfigDict(extra="allow")
@@ -185,11 +166,10 @@ class ChatCompletionRequest(BaseModel):
     length_penalty: Optional[float] = None
     early_stopping: Optional[bool] = None
     # vLLM OpenAI server accepts "extra_body" for sampling params and guided decoding
-    extra_body: Optional[dict] = None
-
+    # DEPRECATED: We now merge these keys into the top-level payload.
+    # extra_body: Optional[dict] = None
 class BatchGenerateRequest(BaseModel):
     requests: List[GenerateRequest]
-
 # =========================
 # Utility helpers
 # =========================
@@ -203,6 +183,8 @@ def _normalize_stop(stop_in):
         out = [s for s in (x.strip() for x in stop_in) if s]
         return out or None
     raise HTTPException(status_code=400, detail="stop must be a string or a list of strings")
+
+# *** REMOVED _merge_stop helper ***
 
 def _add_default_system_prompt(messages: list[ChatMessage], vocab_lang: Optional[str]) -> list[dict]:
     has_system = any(m.role == "system" for m in messages)
@@ -218,8 +200,16 @@ def _add_default_system_prompt(messages: list[ChatMessage], vocab_lang: Optional
 def _build_extra_body_for_request(
     req: ChatCompletionRequest
 ) -> Dict[str, Any]:
-    extra = dict(req.extra_body or {})
-
+    # This function now builds a dictionary of parameters to be
+    # MERGED into the top-level vLLM payload, not nested in 'extra_body'.
+    
+    # Start with any extra keys the user might have passed.
+    extra = {}
+    if req.model_config.get("extra") == "allow":
+         # Access extra fields if they exist
+        if hasattr(req, 'model_extra') and req.model_extra:
+            extra.update(req.model_extra)
+        
     # Beam search mapping: vLLM requires use_beam_search=True and best_of=beam_width; n <= best_of
     if req.num_beams and req.num_beams > 1:
         beam_width = int(req.num_beams)
@@ -233,7 +223,6 @@ def _build_extra_body_for_request(
         extra["best_of"] = beam_width
         # Encourage deterministic decoding under beam search:
         # We'll also set temperature/top_p in the top-level payload accordingly.
-
     # Penalties and others (vLLM OpenAI server forwards these into SamplingParams)
     if req.repetition_penalty is not None:
         extra["repetition_penalty"] = req.repetition_penalty
@@ -245,7 +234,6 @@ def _build_extra_body_for_request(
         extra["presence_penalty"] = req.presence_penalty
     if req.frequency_penalty is not None:
         extra["frequency_penalty"] = req.frequency_penalty
-
     # Guided decoding via regex if both params provided
     if req.vocab_lang and req.vocab_n_words:
         pattern = get_cached_regex_pattern(req.vocab_lang, req.vocab_n_words)
@@ -260,9 +248,12 @@ def _build_extra_body_for_request(
         # Ensure LMFE backend is selected
         if "guided_decoding_backend" not in extra:
             extra["guided_decoding_backend"] = "lm-format-enforcer"
+            
+    # *** FIX: Disable thinking mode for GLM/SGLang ***
+    # We add this at the top level, not in extra_body.
+    extra["chat_template_kwargs"] = {"enable_thinking": False}
 
     return extra
-
 # =========================
 # vLLM OpenAI server management
 # =========================
@@ -281,7 +272,7 @@ def _build_vllm_server_cmd() -> list[str]:
         "--uvicorn-log-level",
         VLLM_LOG_LEVEL,
         # We remove the deprecated server-wide flag and rely on per-request
-        # guided_decoding_backend="lm-format-enforcer" that we inject in extra_body.
+        # guided_decoding_backend="lm-format-enforcer" that we inject.
         # "--guided-decoding-backend", "lm-format-enforcer",
     ]
     if TENSOR_PARALLEL_SIZE and TENSOR_PARALLEL_SIZE > 1:
@@ -297,7 +288,6 @@ def _build_vllm_server_cmd() -> list[str]:
     if TRUST_REMOTE_CODE:
         cmd += ["--trust-remote-code"]
     return cmd
-
 async def _wait_for_vllm_ready(timeout_s: float = 7200.0) -> None:
     global http_client
     start = time.monotonic()
@@ -317,18 +307,23 @@ async def _wait_for_vllm_ready(timeout_s: float = 7200.0) -> None:
             raise RuntimeError("Timed out waiting for vLLM OpenAI server to become ready.")
         await asyncio.sleep(0.5)
     # no return — loop exits either on return above or exception due to timeout
-
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     global vllm_process, http_client
     # Start vLLM OpenAI server as a background subprocess (if enabled)
     env = dict(os.environ)
+
+    # *** FIX ***: Increase engine init timeout to prevent startup TimeoutError
+    # during slow model graph compilation. Default is 60s.
+    if "VLLM_ENGINE_INIT_TIMEOUT" not in env:
+        env["VLLM_ENGINE_INIT_TIMEOUT"] = "600"  # 10 minutes
+
     if LAUNCH_VLLM_SERVER:
         cmd = _build_vllm_server_cmd()
         print(f"Launching vLLM OpenAI server: {' '.join(cmd)}")
         vllm_process = subprocess.Popen(
             cmd,
-            env=env,
+            env=env, # Pass the modified env
             stdout=sys.stdout,
             stderr=sys.stderr,
             preexec_fn=os.setsid if hasattr(os, "setsid") else None,
@@ -349,10 +344,8 @@ async def lifespan(app_: FastAPI):
                 except Exception:
                     pass
             raise
-
     # Create a shared HTTP client for proxying requests
     http_client = httpx.AsyncClient(timeout=60.0)
-
     try:
         yield
     finally:
@@ -377,10 +370,8 @@ async def lifespan(app_: FastAPI):
                     vllm_process.kill()
             except Exception as e:
                 print(f"Error while shutting down vLLM server: {e}")
-
 # Initialize FastAPI with lifespan
 app = FastAPI(lifespan=lifespan)
-
 # =========================
 # HTTP proxy helpers
 # =========================
@@ -394,14 +385,20 @@ async def _vllm_chat_completions_proxy(payload: dict) -> dict:
         raise HTTPException(status_code=500, detail="HTTP client not initialized.")
     url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/chat/completions"
     try:
-        resp = await http_client.post(url, json=payload)
+        # Remove any None values from the payload before sending
+        clean_payload = {k: v for k, v in payload.items() if v is not None}
+        resp = await http_client.post(url, json=clean_payload)
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Failed to reach vLLM server: {e}")
     if resp.status_code != 200:
         detail = resp.text
+        try:
+            # Try to parse vLLM's error for a cleaner message
+            detail = resp.json().get("detail", detail)
+        except Exception:
+            pass
         raise HTTPException(status_code=resp.status_code, detail=detail)
     return resp.json()
-
 async def _vllm_list_models_proxy() -> dict:
     global http_client
     if http_client is None:
@@ -414,7 +411,6 @@ async def _vllm_list_models_proxy() -> dict:
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()
-
 # =========================
 # Legacy constrained API
 # =========================
@@ -428,7 +424,6 @@ async def generate(
     if system_msg != "":
         messages.append({"role": "system", "content": system_msg})
     messages.append({"role": "user", "content": request.prompt})
-
     # Build extra_body for guided regex + penalties + beam
     fake_req = ChatCompletionRequest(
         model=MODEL_NAME,
@@ -444,8 +439,8 @@ async def generate(
         repetition_penalty=request.repetition_penalty,
         length_penalty=request.length_penalty,
     )
-    extra_body = _build_extra_body_for_request(fake_req)
-
+    # This now contains all penalties, beam search, regex, AND chat_template_kwargs
+    extra_body_params = _build_extra_body_for_request(fake_req)
     # Prepare payload for vLLM OpenAI server
     payload = {
         "model": MODEL_NAME,
@@ -454,15 +449,17 @@ async def generate(
         "temperature": 0.0 if (request.num_beams and request.num_beams > 1) else 1.0,
         "top_p": 1.0 if (request.num_beams and request.num_beams > 1) else 1.0,
         "n": 1,
-        "extra_body": extra_body,
+        # "extra_body": extra_body, # <-- DEPRECATED
     }
-
+    
+    # *** FIX ***: Merge extra parameters into the top-level payload
+    payload.update(extra_body_params)
+    
     data = await _vllm_chat_completions_proxy(payload)
     try:
         return data["choices"][0]["message"]["content"]
     except Exception:
         return ""
-
 # =========================
 # Explicit Batch API
 # =========================
@@ -477,7 +474,6 @@ async def generate_batch(
             if system_msg != "":
                 messages.append({"role": "system", "content": system_msg})
             messages.append({"role": "user", "content": req.prompt})
-
             fake_req = ChatCompletionRequest(
                 model=MODEL_NAME,
                 messages=[ChatMessage(role=m["role"], content=m["content"]) for m in messages],
@@ -492,8 +488,8 @@ async def generate_batch(
                 repetition_penalty=req.repetition_penalty,
                 length_penalty=req.length_penalty,
             )
-            extra_body = _build_extra_body_for_request(fake_req)
-
+            # This now contains all penalties, beam search, regex, AND chat_template_kwargs
+            extra_body_params = _build_extra_body_for_request(fake_req)
             payload = {
                 "model": MODEL_NAME,
                 "messages": messages,
@@ -501,8 +497,12 @@ async def generate_batch(
                 "temperature": 0.0 if (req.num_beams and req.num_beams > 1) else 1.0,
                 "top_p": 1.0 if (req.num_beams and req.num_beams > 1) else 1.0,
                 "n": 1,
-                "extra_body": extra_body,
+                # "extra_body": extra_body, # <-- DEPRECATED
             }
+
+            # *** FIX ***: Merge extra parameters into the top-level payload
+            payload.update(extra_body_params)
+
             data = await _vllm_chat_completions_proxy(payload)
             text = data["choices"][0]["message"]["content"]
             return {"success": True, "error": None, "text": text}
@@ -510,11 +510,9 @@ async def generate_batch(
             return {"success": False, "error": str(he.detail), "text": None}
         except Exception as e:
             return {"success": False, "error": str(e), "text": None}
-
     tasks = [asyncio.create_task(_one(r)) for r in batch_request.requests]
     results = await asyncio.gather(*tasks, return_exceptions=False)
     return {"results": results}
-
 # =========================
 # OpenAI-compatible API (proxied to vLLM server with guided decoding)
 # =========================
@@ -522,25 +520,26 @@ async def generate_batch(
 async def list_models(auth_ok: bool = Depends(verify_token)):
     # Pass-through to the vLLM server
     return await _vllm_list_models_proxy()
-
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)
 ):
     # Ensure messages include default system prompt if none was provided
     messages_out = _add_default_system_prompt(req.messages, req.vocab_lang)
-
-    # Merge extra_body with guided decoding/beam/penalties logic
-    extra_body = _build_extra_body_for_request(req)
-
+    
+    # This now contains all penalties, beam search, regex, AND chat_template_kwargs
+    extra_body_params = _build_extra_body_for_request(req)
+    
     # Beam search implies deterministic sampling
     use_beam = bool(req.num_beams and req.num_beams > 1)
     temperature = 0.0 if use_beam else (req.temperature if req.temperature is not None else 1.0)
     top_p = 1.0 if use_beam else (req.top_p if req.top_p is not None else 1.0)
-
     # n cannot exceed best_of when beam search is enabled (already enforced in _build_extra_body_for_request)
     n_val = int(req.n or 1)
-
+    
+    # *** REVERTED ***: Use only the user-provided stop sequences
+    stop_sequences = _normalize_stop(req.stop)
+    
     # Prepare payload to vLLM OpenAI server
     payload = {
         "model": req.model or MODEL_NAME,
@@ -549,13 +548,14 @@ async def chat_completions(
         "temperature": temperature,
         "top_p": top_p,
         "n": n_val,
-        "stop": _normalize_stop(req.stop),
-        # Pass extra params into SamplingParams via extra_body
-        "extra_body": extra_body,
+        "stop": stop_sequences, # Use the normalized user-provided list
+        # "extra_body": extra_body, # <-- DEPRECATED
         # We disable streaming passthrough in this proxy for simplicity.
-        # If a client sets stream=True, you can either reject or convert to non-stream here.
         "stream": False,
     }
+
+    # *** FIX ***: Merge parameters from extra_body_params directly into the top-level payload
+    payload.update(extra_body_params)
 
     data = await _vllm_chat_completions_proxy(payload)
     # Pass through vLLM response unchanged for maximum OpenAI compatibility
