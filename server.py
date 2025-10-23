@@ -1,38 +1,19 @@
 # --- Load environment ASAP ---
 from dotenv import load_dotenv
 load_dotenv()
+
 import os
 import re
 import time
 import uuid
 import asyncio
-from typing import Literal, Optional, List
+import signal
+import subprocess
+from typing import Literal, Optional, List, Dict, Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel, ConfigDict  # <-- MODIFICATION
-
-# lm-format-enforcer
-try:
-    from lmformatenforcer import RegexParser
-except ImportError:
-    # Fallback import path in some installations
-    from lmformatenforcer.regexparser import RegexParser
-from lmformatenforcer.integrations.transformers import build_token_enforcer_tokenizer_data
-from lmformatenforcer.integrations.vllm import build_vllm_logits_processor
-
-# vLLM
-from vllm import AsyncLLMEngine, SamplingParams
-from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.outputs import RequestOutput
-
-# HF tokenizer
-from transformers import AutoTokenizer
-
-# functools.cache fallback for older Python
-try:
-    from functools import cache
-except ImportError:
-    from functools import lru_cache as cache
+from pydantic import BaseModel, ConfigDict
 
 # =========================
 # Fallback request schemas
@@ -41,12 +22,11 @@ try:
     from common import GenerateRequest
 except ImportError:
     print("Warning: common.GenerateRequest not found. Using placeholder definition.")
-
     class GenerateRequest(BaseModel):
         prompt: str
         max_new_tokens: int = 100
-        repetition_penalty: Optional[float] = 1.0
-        length_penalty: Optional[float] = 1.0
+        repetition_penalty: Optional[float] = 1.0  # not used by vLLM OpenAI API
+        length_penalty: Optional[float] = 1.0      # not used by vLLM OpenAI API
         num_beams: Optional[int] = 1
         vocab_lang: Optional[Literal["en", "es"]] = None
         vocab_n_words: Optional[int] = None
@@ -60,75 +40,46 @@ app = FastAPI()
 # Config via environment
 # =========================
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
+
+# vLLM server spawn / connection
+START_VLLM_SERVER = os.getenv("START_VLLM_SERVER", "true").lower() == "true"
+VLLM_HOST = os.getenv("VLLM_HOST", "127.0.0.1")
+VLLM_PORT = int(os.getenv("VLLM_PORT", "8011"))
+VLLM_BASE_URL = f"http://{VLLM_HOST}:{VLLM_PORT}"
+
+# vLLM engine args
 DTYPE_STR = os.getenv("TORCH_DTYPE", "auto").lower()
-QUANTIZATION = os.getenv("QUANTIZATION", None)
 TENSOR_PARALLEL_SIZE = int(os.getenv("TENSOR_PARALLEL_SIZE", 1))
 GPU_MEMORY_UTILIZATION = float(os.getenv("GPU_MEMORY_UTILIZATION", 0.90))
 MAX_MODEL_LEN = int(os.getenv("MAX_MODEL_LEN", 0))
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
+
+# HF tokens and cache
+HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
+HF_HOME = os.getenv("HF_HOME", None)
+
+# Auth for this proxy server
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
+
+# Default system prompts
 DEFAULT_SYSTEM_PROMPT_EN = os.getenv("DEFAULT_SYSTEM_PROMPT_EN", "")
 DEFAULT_SYSTEM_PROMPT_ES = os.getenv("DEFAULT_SYSTEM_PROMPT_ES", "")
+
+# Prebuild constrained vocab regex parsers at startup
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
-# Optional HF token for gated models/tokenizers
-HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN") or os.getenv("HF_TOKEN")
-# Optional: enable lm-format-enforcer analyzer
-LOGITS_ANALYZE = os.getenv("LOGITS_ANALYZE", "false").lower() == "true"
+
+# Optional: server-level guided decoding backend (we still set per-request too)
+GUIDED_DECODING_BACKEND = os.getenv("GUIDED_DECODING_BACKEND", "lm-format-enforcer")
 
 # =========================
-# Initialize vLLM engine
-# =========================
-print(f"Initializing vLLM Async Engine for {MODEL_NAME}...")
-print(
-    f"TP Size: {TENSOR_PARALLEL_SIZE}, Quant: {QUANTIZATION}, Dtype: {DTYPE_STR}, Trust Remote: {TRUST_REMOTE_CODE}"
-)
-engine_args_kwargs = {
-    "model": MODEL_NAME,
-    "dtype": DTYPE_STR,
-    "quantization": QUANTIZATION,
-    "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-    "trust_remote_code": TRUST_REMOTE_CODE,
-    "gpu_memory_utilization": GPU_MEMORY_UTILIZATION,
-}
-if MAX_MODEL_LEN > 0:
-    engine_args_kwargs["max_model_len"] = MAX_MODEL_LEN
-    print(f"Overriding Max Model Length to: {MAX_MODEL_LEN}")
-try:
-    engine_args = AsyncEngineArgs(**engine_args_kwargs)
-    llm = AsyncLLMEngine.from_engine_args(engine_args)
-except Exception as e:
-    print(f"CRITICAL: Failed to initialize vLLM engine: {e}")
-    print(
-        f"Ensure you have {TENSOR_PARALLEL_SIZE} GPUs available and the configuration is supported."
-    )
-    raise
-
-# =========================
-# Tokenizer (synchronous)
-# =========================
-try:
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE, token=HF_TOKEN
-    )
-except Exception as e:
-    print(
-        f"CRITICAL: Failed to load AutoTokenizer synchronously ({e}). Cannot initialize format enforcer."
-    )
-    raise
-
-# Build tokenizer_data for vLLM logits processor once
-tokenizer_data = build_token_enforcer_tokenizer_data(tokenizer)
-
-# =========================
-# Wordlist-based RegexParser
+# Wordlist-based Regex Builder (no LMFE import required)
 # =========================
 def _here_file(*parts: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(here, *parts)
-
 
 def _load_words(lang: Literal["en", "es"], n_words: int) -> list[str]:
     filename = _here_file(f"{lang}.txt")
@@ -138,29 +89,33 @@ def _load_words(lang: Literal["en", "es"], n_words: int) -> list[str]:
         words = [w.strip() for w in fin if w.strip()]
     return words[:n_words]
 
+# Simple cache for patterns
+_regex_cache: Dict[tuple[str, int], Optional[str]] = {}
 
-@cache
-def get_cached_regex_parser(
-    lang: Literal["en", "es"], n_words: int
-) -> Optional[RegexParser]:
+def get_cached_wordlist_regex(
+    lang: Optional[Literal["en", "es"]],
+    n_words: Optional[int],
+) -> Optional[str]:
     """
-    Build a case-flexible wordlist regex parser with optional trailing punctuation,
-    adapted from the user's transformers prefix function.
+    Build a case-flexible wordlist regex with optional punctuation between words.
     Grammar (prefix-friendly):
       (SEP)? (WORD) (SEP WORD)* (SEP)?
-    where:
-      WORD matches any word from the list with only the initial letter case-insensitive.
-      SEP  matches punctuation/whitespace between words.
     """
+    if not (lang and n_words):
+        return None
+    key = (lang, n_words)
+    if key in _regex_cache:
+        return _regex_cache[key]
     try:
         words = _load_words(lang, n_words)
     except FileNotFoundError as e:
         print(str(e))
+        _regex_cache[key] = None
         return None
     if not words:
         print(f"Warning: {lang}.txt is empty or contains no valid words.")
+        _regex_cache[key] = None
         return None
-
     alts = []
     for w in words:
         if not w:
@@ -168,28 +123,28 @@ def get_cached_regex_parser(
         first = w[0]
         rest = w[1:]
         if first.isalpha():
+            # Build an alt where just the first letter is case-insensitive
             esc_rest = re.escape(rest)
             lc, uc = first.lower(), first.upper()
             alts.append(f"(?:[{lc}{uc}]{esc_rest})")
         else:
             alts.append(f"(?:{re.escape(w)})")
-
+    if not alts:
+        _regex_cache[key] = None
+        return None
     word_alt = "|".join(alts)
-    # Allow typical punctuation and spaces between words (includes quotes)
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
-    # Allow optional leading SEP and optional trailing SEP
-    # Removed ^ and $ anchors as they are unsupported by interegular
+    # No ^/$ anchors to keep it prefix-friendly for guided decoding
     pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
-    return RegexParser(pattern)
-
+    _regex_cache[key] = pattern
+    return pattern
 
 if PREBUILD_PREFIX:
-    print("prebuilding regex parsers...")
-    # Only Spanish prebuild as requested
+    print("Prebuilding regex patterns...")
     for lang in ("es",):
-        for n_words in PREBUILD_WORD_COUNTS:
-            get_cached_regex_parser(lang, n_words)
-    print("done")
+        for n in PREBUILD_WORD_COUNTS:
+            _ = get_cached_wordlist_regex(lang, n)
+    print("Done prebuilding patterns.")
 
 # =========================
 # Auth helper
@@ -207,7 +162,6 @@ def verify_token(
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
 
-
 # =========================
 # Pydantic Models (OpenAI)
 # =========================
@@ -215,34 +169,28 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
 
-
 class ChatCompletionRequest(BaseModel):
-    model_config = ConfigDict(extra='ignore')  # <-- MODIFICATION
-
-    model: str
-    messages: list[ChatMessage]
+    model_config = ConfigDict(extra='ignore')
+    model: Optional[str] = None
+    messages: List[ChatMessage]
     max_tokens: Optional[int] = None
     temperature: Optional[float] = 1.0
     top_p: Optional[float] = 1.0
     n: Optional[int] = 1
-    stop: Optional[list[str] | str] = None
+    stop: Optional[List[str] | str] = None
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     # Custom parameters
     vocab_lang: Optional[Literal["en", "es"]] = None
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = None
-    repetition_penalty: Optional[float] = None
-    length_penalty: Optional[float] = None
-    early_stopping: Optional[bool] = None  # if supported by vLLM
-
+    early_stopping: Optional[bool] = None  # forwarded via extra_body
 
 class BatchGenerateRequest(BaseModel):
     requests: List[GenerateRequest]
 
-
 # =========================
-# Inference helpers
+# Utilities
 # =========================
 def _normalize_stop(stop_in):
     if stop_in is None:
@@ -257,167 +205,175 @@ def _normalize_stop(stop_in):
         status_code=400, detail="stop must be a string or a list of strings"
     )
 
-
-def _build_logits_processors(vocab_lang, vocab_n_words):
-    if not (vocab_lang and vocab_n_words):
-        return None, None
-    parser = get_cached_regex_parser(vocab_lang, vocab_n_words)
-    if parser is None:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Dictionary file {vocab_lang}.txt not found or empty.",
-        )
-    logits_proc = build_vllm_logits_processor(
-        tokenizer_data, parser, analyze=LOGITS_ANALYZE
-    )
-    return parser, [logits_proc]
-
-
-def _sig_has_param(param: str) -> bool:
-    try:
-        from inspect import signature
-
-        sig = signature(SamplingParams.__init__)
-        return param in sig.parameters
-    except Exception:
-        return False
-
-
-def _create_sampling_params(request) -> SamplingParams:
-    # Map generic fields
-    if isinstance(request, GenerateRequest):
-        params = {
-            "max_tokens": request.max_new_tokens,
-            "temperature": 1.0,
-            "top_p": 1.0,
-            "repetition_penalty": request.repetition_penalty or 1.0,
-            "length_penalty": request.length_penalty
-            if request.length_penalty is not None
-            else 1.0,
-            "num_beams": int(request.num_beams or 1),
-            "vocab_lang": request.vocab_lang,
-            "vocab_n_words": request.vocab_n_words,
-            "n": 1,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "stop": None,
-            "early_stopping": None,
-        }
-    elif isinstance(request, ChatCompletionRequest):
-        params = {
-            "max_tokens": request.max_tokens or 100,
-            "temperature": 0.0
-            if (request.num_beams and request.num_beams > 1)
-            else (
-                request.temperature
-                if request.temperature is not None
-                else 1.0
-            ),
-            "top_p": 1.0
-            if (request.num_beams and request.num_beams > 1)
-            else (request.top_p if request.top_p is not None else 1.0),
-            "repetition_penalty": request.repetition_penalty or 1.0,
-            "length_penalty": request.length_penalty
-            if request.length_penalty is not None
-            else 1.0,
-            "num_beams": int(request.num_beams or 1),
-            "vocab_lang": request.vocab_lang,
-            "vocab_n_words": request.vocab_n_words,
-            "stop": _normalize_stop(request.stop),
-            "n": int(request.n or 1),
-            "presence_penalty": request.presence_penalty
-            if request.presence_penalty is not None
-            else 0.0,
-            "frequency_penalty": request.frequency_penalty
-            if request.frequency_penalty is not None
-            else 0.0,
-            "early_stopping": request.early_stopping,
-        }
-    else:
-        raise HTTPException(status_code=400, detail="Invalid request type")
-
-    # Build logits processors if constraints requested
-    parser, logits_processors = _build_logits_processors(
-        params["vocab_lang"], params["vocab_n_words"]
-    )
-
+def _build_vllm_payload_for_chat(req: ChatCompletionRequest) -> Dict[str, Any]:
     # Beam search handling
-    use_beam_search = params["num_beams"] > 1
-    if use_beam_search:
-        # In vLLM, use_beam_search=True, best_of = beam width, and n <= best_of
-        beam_width = params["num_beams"]
-        if params["n"] > beam_width:
-            raise HTTPException(
-                status_code=400,
-                detail=f"n ({params['n']}) cannot exceed num_beams ({beam_width}) when using beam search.",
-            )
-        best_of = beam_width
-        # Enforce deterministic decoding settings commonly required by vLLM beam search
-        params["temperature"] = 0.0
-        params["top_p"] = 1.0
-    else:
-        best_of = max(1, params["n"])
-
-    # Assemble SamplingParams kwargs, adding optional keys only if supported by this vLLM build
-    sp_kwargs = dict(
-        max_tokens=params["max_tokens"],
-        temperature=params["temperature"],
-        top_p=params["top_p"],
-        repetition_penalty=params["repetition_penalty"],
-        best_of=best_of,
-        stop=params["stop"],
-        n=params["n"],
-    )
-
-    # Optional parameters (guard by signature)
-    if _sig_has_param("use_beam_search"):
-        sp_kwargs["use_beam_search"] = use_beam_search
-    elif use_beam_search:
-        # If this build doesn't support the flag, fail early with a helpful error
+    num_beams = int(req.num_beams or 1)
+    use_beam_search = num_beams > 1
+    n = int(req.n or 1)
+    if use_beam_search and n > num_beams:
         raise HTTPException(
             status_code=400,
-            detail="This vLLM build does not support use_beam_search in SamplingParams.",
+            detail=f"n ({n}) cannot exceed num_beams ({num_beams}) when using beam search.",
         )
 
-    if _sig_has_param("length_penalty") and params["length_penalty"] is not None:
-        sp_kwargs["length_penalty"] = params["length_penalty"]
-    if _sig_has_param("early_stopping") and params.get("early_stopping") is not None:
-        sp_kwargs["early_stopping"] = params["early_stopping"]
-    if _sig_has_param("presence_penalty"):
-        sp_kwargs["presence_penalty"] = params.get("presence_penalty", 0.0)
-    if _sig_has_param("frequency_penalty"):
-        sp_kwargs["frequency_penalty"] = params.get("frequency_penalty", 0.0)
+    # Regex pattern from wordlist (if requested)
+    guided_regex = get_cached_wordlist_regex(req.vocab_lang, req.vocab_n_words)
 
-    # Add logits processors only if supported by this vLLM build
-    if logits_processors:
-        if _sig_has_param("logits_processors"):
-            sp_kwargs["logits_processors"] = logits_processors
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="This vLLM build does not support logits_processors. Upgrade vLLM to use format enforcement.",
-            )
+    # Temperature/top_p deterministic under beam search
+    temperature = 0.0 if use_beam_search else (req.temperature if req.temperature is not None else 1.0)
+    top_p = 1.0 if use_beam_search else (req.top_p if req.top_p is not None else 1.0)
 
-    try:
-        sampling_params = SamplingParams(**sp_kwargs)
-    except (ValueError, TypeError) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid sampling parameters: {e}")
-    return sampling_params
+    payload: Dict[str, Any] = {
+        "model": req.model or MODEL_NAME,
+        "messages": [m.model_dump() for m in req.messages],
+        "max_tokens": req.max_tokens or 100,
+        "temperature": temperature,
+        "top_p": top_p,
+        "n": n,
+        "stop": _normalize_stop(req.stop),
+        "presence_penalty": req.presence_penalty if req.presence_penalty is not None else 0.0,
+        "frequency_penalty": req.frequency_penalty if req.frequency_penalty is not None else 0.0,
+        "extra_body": {
+            # Core: enable LMFE on vLLM server
+            "guided_decoding_backend": GUIDED_DECODING_BACKEND,
+            # Only include guided_regex if we actually built one
+            **({"guided_regex": guided_regex} if guided_regex else {}),
+            # Beam search extras for vLLM OpenAI server
+            **({"use_beam_search": True, "best_of": num_beams} if use_beam_search else {}),
+            # Optional early_stopping passthrough (vLLM accepts it in extra_body)
+            **({"early_stopping": req.early_stopping} if req.early_stopping is not None else {}),
+        },
+    }
+    return payload
 
+def _build_vllm_payload_for_prompt(
+    prompt: str,
+    max_new_tokens: int,
+    num_beams: int,
+    vocab_lang: Optional[Literal["en","es"]],
+    vocab_n_words: Optional[int],
+    system_msg_en: str,
+    system_msg_es: str,
+) -> Dict[str, Any]:
+    messages = []
+    system_msg = system_msg_es if vocab_lang == "es" else system_msg_en
+    if system_msg != "":
+        messages.append({"role": "system", "content": system_msg})
+    messages.append({"role": "user", "content": prompt})
 
-async def run_inference(
-    prompt_text: str, sampling_params: SamplingParams
-) -> RequestOutput:
-    """
-    Run async generation and collect the final RequestOutput from the async iterator.
-    """
-    request_id = str(uuid.uuid4())
-    agen = llm.generate(prompt_text, sampling_params, request_id)
-    final_output: Optional[RequestOutput] = None
-    async for ro in agen:
-        final_output = ro
-    return final_output
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[ChatMessage(**m) for m in messages],
+        max_tokens=max_new_tokens,
+        num_beams=num_beams,
+        vocab_lang=vocab_lang,
+        vocab_n_words=vocab_n_words,
+        temperature=1.0,
+        top_p=1.0,
+        n=1,
+    )
+    return _build_vllm_payload_for_chat(req)
 
+# =========================
+# vLLM server process management
+# =========================
+_vllm_proc: Optional[subprocess.Popen] = None
+_http_client: Optional[httpx.AsyncClient] = None
+
+async def _wait_for_vllm_ready(timeout_s: int = 180) -> None:
+    deadline = time.time() + timeout_s
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        while time.time() < deadline:
+            try:
+                r = await client.get(f"{VLLM_BASE_URL}/v1/models")
+                if r.status_code == 200:
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+    raise RuntimeError("Timed out waiting for vLLM OpenAI server to become ready.")
+
+def _spawn_vllm_server():
+    global _vllm_proc
+    if _vllm_proc is not None and _vllm_proc.poll() is None:
+        return  # already running
+
+    cmd = [
+        "python",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model", MODEL_NAME,
+        "--host", VLLM_HOST,
+        "--port", str(VLLM_PORT),
+        "--tensor-parallel-size", str(TENSOR_PARALLEL_SIZE),
+        "--gpu-memory-utilization", str(GPU_MEMORY_UTILIZATION),
+        "--guided-decoding-backend", GUIDED_DECODING_BACKEND,
+    ]
+    if TRUST_REMOTE_CODE:
+        cmd += ["--trust-remote-code"]
+    if DTYPE_STR:
+        cmd += ["--dtype", DTYPE_STR]
+    if MAX_MODEL_LEN > 0:
+        cmd += ["--max-model-len", str(MAX_MODEL_LEN)]
+    if HF_HOME:
+        cmd += ["--download-dir", HF_HOME]
+    # Helpful for UI testing across origins
+    cmd += ["--cors-origins", "*"]
+
+    env = os.environ.copy()
+    if HF_TOKEN:
+        env["HUGGING_FACE_HUB_TOKEN"] = HF_TOKEN
+
+    print("Starting vLLM OpenAI server:", " ".join(cmd))
+    _vllm_proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+@app.on_event("startup")
+async def on_startup():
+    global _http_client
+    if START_VLLM_SERVER:
+        _spawn_vllm_server()
+        # Wait for readiness
+        await _wait_for_vllm_ready()
+        print(f"vLLM OpenAI server ready at {VLLM_BASE_URL}")
+    _http_client = httpx.AsyncClient(base_url=VLLM_BASE_URL, timeout=120.0)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global _http_client, _vllm_proc
+    if _http_client:
+        await _http_client.aclose()
+        _http_client = None
+    if _vllm_proc and _vllm_proc.poll() is None:
+        print("Stopping vLLM OpenAI server...")
+        try:
+            _vllm_proc.send_signal(signal.SIGTERM)
+            try:
+                _vllm_proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                _vllm_proc.kill()
+        except Exception:
+            pass
+        _vllm_proc = None
+
+# =========================
+# Proxy helpers
+# =========================
+async def _post_vllm(path: str, json: Dict[str, Any]) -> httpx.Response:
+    if not _http_client:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+    return await _http_client.post(path, json=json)
+
+async def _get_vllm(path: str) -> httpx.Response:
+    if not _http_client:
+        raise HTTPException(status_code=500, detail="HTTP client not initialized")
+    return await _http_client.get(path)
 
 # =========================
 # Legacy constrained API
@@ -426,31 +382,27 @@ async def run_inference(
 async def generate(
     request: GenerateRequest, auth_ok: bool = Depends(verify_token)
 ) -> str:
-    system_msg = (
-        DEFAULT_SYSTEM_PROMPT_ES if request.vocab_lang == "es" else DEFAULT_SYSTEM_PROMPT_EN
-    )
-    messages = []
-    if system_msg != "":
-        messages.append({"role": "system", "content": system_msg})
-    messages.append({"role": "user", "content": request.prompt})
-    # Apply chat template, with a fallback to raw prompt
     try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True,
-            enable_thinking=False
+        payload = _build_vllm_payload_for_prompt(
+            prompt=request.prompt,
+            max_new_tokens=request.max_new_tokens,
+            num_beams=int(request.num_beams or 1),
+            vocab_lang=request.vocab_lang,
+            vocab_n_words=request.vocab_n_words,
+            system_msg_en=DEFAULT_SYSTEM_PROMPT_EN,
+            system_msg_es=DEFAULT_SYSTEM_PROMPT_ES,
         )
+        r = await _post_vllm("/v1/chat/completions", payload)
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code, detail=r.text)
+        data = r.json()
+        if data.get("choices"):
+            return data["choices"][0]["message"]["content"]
+        return ""
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"Error applying chat template: {e}. Falling back to raw prompt.")
-        prompt_text = request.prompt
-
-    sampling_params = _create_sampling_params(request)
-    final_output = await run_inference(prompt_text, sampling_params)
-    if final_output and final_output.outputs:
-        return final_output.outputs[0].text
-    return ""
-
+        raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
 # Explicit Batch API
@@ -460,151 +412,70 @@ async def generate_batch(
     batch_request: BatchGenerateRequest, auth_ok: bool = Depends(verify_token)
 ):
     tasks = []
-
-    async def _create_failing_task(error_msg: str):
-        raise Exception(error_msg)
-
     for i, request in enumerate(batch_request.requests):
-        try:
-            system_msg = (
-                DEFAULT_SYSTEM_PROMPT_ES
-                if request.vocab_lang == "es"
-                else DEFAULT_SYSTEM_PROMPT_EN
-            )
-            messages = []
-            if system_msg != "":
-                messages.append({"role": "system", "content": system_msg})
-            messages.append({"role": "user", "content": request.prompt})
-            try:
-                prompt_text = tokenizer.apply_chat_template(
-                    messages, 
-                    tokenize=False, 
-                    add_generation_prompt=True,
-                    enable_thinking=False
-                )
-            except Exception as e:
-                print(
-                    f"Error applying chat template (idx={i}): {e}. Falling back to raw prompt."
-                )
-                prompt_text = request.prompt
-            sampling_params = _create_sampling_params(request)
-            tasks.append(run_inference(prompt_text, sampling_params))
-        except Exception as e:
-            detail = str(e.detail) if isinstance(e, HTTPException) else str(e)
-            print(f"Error preparing request index {i}: {detail}")
-            tasks.append(_create_failing_task(f"Preparation Error: {detail}"))
+        payload = _build_vllm_payload_for_prompt(
+            prompt=request.prompt,
+            max_new_tokens=request.max_new_tokens,
+            num_beams=int(request.num_beams or 1),
+            vocab_lang=request.vocab_lang,
+            vocab_n_words=request.vocab_n_words,
+            system_msg_en=DEFAULT_SYSTEM_PROMPT_EN,
+            system_msg_es=DEFAULT_SYSTEM_PROMPT_ES,
+        )
+        tasks.append(_post_vllm("/v1/chat/completions", payload))
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
     outputs = []
-    for final_output in results:
-        if isinstance(final_output, Exception):
-            outputs.append(
-                {"success": False, "error": str(final_output), "text": None}
-            )
-        elif isinstance(final_output, RequestOutput) and final_output.outputs:
-            outputs.append(
-                {
-                    "success": True,
-                    "error": None,
-                    "text": final_output.outputs[0].text,
-                }
-            )
+    for r in results:
+        if isinstance(r, Exception):
+            outputs.append({"success": False, "error": str(r), "text": None})
         else:
-            outputs.append(
-                {
-                    "success": True,
-                    "error": "Generation produced no output.",
-                    "text": "",
-                }
-            )
+            try:
+                data = r.json()
+                if r.status_code != 200:
+                    outputs.append({"success": False, "error": r.text, "text": None})
+                elif data.get("choices"):
+                    outputs.append({"success": True, "error": None, "text": data["choices"][0]["message"]["content"]})
+                else:
+                    outputs.append({"success": True, "error": "Generation produced no output.", "text": ""})
+            except Exception as e:
+                outputs.append({"success": False, "error": str(e), "text": None})
     return {"results": outputs}
 
-
 # =========================
-# OpenAI-compatible API
+# OpenAI-compatible API (proxied)
 # =========================
 @app.get("/v1/models")
-def list_models(auth_ok: bool = Depends(verify_token)):
+async def list_models(auth_ok: bool = Depends(verify_token)):
+    # Prefer to proxy vLLM for exact metadata
+    try:
+        r = await _get_vllm("/v1/models")
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    # Fallback minimal response
     return {
         "object": "list",
         "data": [{"id": MODEL_NAME, "object": "model", "owned_by": "owner"}],
     }
 
-
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)
 ):
-    start_time = time.time()
+    # 1) Ensure a system prompt if none supplied and env default exists
+    has_system = any(m.role == "system" for m in req.messages)
+    if not has_system:
+        system_prompt = DEFAULT_SYSTEM_PROMPT_EN
+        if system_prompt != "":
+            req.messages = [ChatMessage(role="system", content=system_prompt)] + req.messages
 
-    # 1) Determine effective system prompt
-    system_prompt = DEFAULT_SYSTEM_PROMPT_EN
-    for msg in req.messages:
-        if msg.role == "system":
-            system_prompt = msg.content
-            break
+    # 2) Build vLLM payload (adds guided_regex + beam search in extra_body)
+    payload = _build_vllm_payload_for_chat(req)
 
-    # 2) Build message list for template
-    messages = []
-    if system_prompt != "":
-        messages.append({"role": "system", "content": system_prompt})
-    for msg in req.messages:
-        if msg.role != "system":
-            messages.append({"role": msg.role, "content": msg.content})
-
-    # 3) Apply chat template (fallback to last user message)
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False, 
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-    except Exception as e:
-        print(f"Error applying chat template: {e}. Messages: {messages}")
-        # Fallback: last non-system message or empty
-        prompt_text = ""
-        for m in reversed(messages):
-            if m["role"] != "system":
-                prompt_text = m["content"]
-                break
-        if not prompt_text:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Error applying chat template and no usable fallback prompt: {e}",
-            )
-
-    # 4) Build SamplingParams
-    sampling_params = _create_sampling_params(req)
-
-    # 5) Run async inference
-    final_output = await run_inference(prompt_text, sampling_params)
-    if not final_output:
-        raise HTTPException(status_code=500, detail="Generation failed")
-
-    # 6) Format response
-    created = int(start_time)
-    prompt_tokens = len(final_output.prompt_token_ids)
-    choices = []
-    for i, completion_output in enumerate(final_output.outputs):
-        choices.append(
-            {
-                "index": i,
-                "message": {"role": "assistant", "content": completion_output.text},
-                "finish_reason": completion_output.finish_reason or "stop",
-            }
-        )
-    completion_tokens = sum(len(o.token_ids) for o in final_output.outputs)
-    resp = {
-        "id": f"chatcmpl-{uuid.uuid4()}",
-        "object": "chat.completion",
-        "created": created,
-        "model": req.model or MODEL_NAME,
-        "choices": choices,
-        "usage": {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        },
-    }
-    return resp
+    # 3) Proxy to vLLM OpenAI server
+    r = await _post_vllm("/v1/chat/completions", payload)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=r.text)
+    return r.json()
