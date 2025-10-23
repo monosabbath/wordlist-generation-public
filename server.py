@@ -298,7 +298,7 @@ def _build_vllm_server_cmd() -> list[str]:
         cmd += ["--trust-remote-code"]
     return cmd
 
-async def _wait_for_vllm_ready(timeout_s: float = 180.0) -> None:
+async def _wait_for_vllm_ready(timeout_s: float = 7200.0) -> None:
     global http_client
     start = time.monotonic()
     url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models"
