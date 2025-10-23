@@ -9,7 +9,7 @@ import asyncio
 from typing import Literal, Optional, List
 
 from fastapi import Depends, FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict  # <-- MODIFICATION
 
 # lm-format-enforcer
 try:
@@ -147,7 +147,7 @@ def get_cached_regex_parser(
     Build a case-flexible wordlist regex parser with optional trailing punctuation,
     adapted from the user's transformers prefix function.
     Grammar (prefix-friendly):
-      ^ (SEP)? (WORD) (SEP WORD)* (SEP)? $
+      (SEP)? (WORD) (SEP WORD)* (SEP)?
     where:
       WORD matches any word from the list with only the initial letter case-insensitive.
       SEP  matches punctuation/whitespace between words.
@@ -178,6 +178,7 @@ def get_cached_regex_parser(
     # Allow typical punctuation and spaces between words (includes quotes)
     sep_re = r"[-.,!?():;¿¡\"'“”‘’\s]+"
     # Allow optional leading SEP and optional trailing SEP
+    # Removed ^ and $ anchors as they are unsupported by interegular
     pattern = f"(?:{sep_re})?(?:{word_alt})(?:{sep_re}(?:{word_alt}))*(?:{sep_re})?"
     return RegexParser(pattern)
 
@@ -216,6 +217,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra='ignore')  # <-- MODIFICATION
+
     model: str
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
@@ -436,7 +439,7 @@ async def generate(
             messages, 
             tokenize=False, 
             add_generation_prompt=True,
-            enable_thinking=False  # <-- MODIFICATION
+            enable_thinking=False
         )
     except Exception as e:
         print(f"Error applying chat template: {e}. Falling back to raw prompt.")
@@ -477,7 +480,7 @@ async def generate_batch(
                     messages, 
                     tokenize=False, 
                     add_generation_prompt=True,
-                    enable_thinking=False  # <-- MODIFICATION
+                    enable_thinking=False
                 )
             except Exception as e:
                 print(
@@ -555,7 +558,7 @@ async def chat_completions(
             messages, 
             tokenize=False, 
             add_generation_prompt=True,
-            enable_thinking=False  # <-- MODIFICATION
+            enable_thinking=False
         )
     except Exception as e:
         print(f"Error applying chat template: {e}. Messages: {messages}")
