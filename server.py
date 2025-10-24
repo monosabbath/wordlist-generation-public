@@ -211,7 +211,7 @@ def buildword_regex_for_n(lang: Literal["en", "es"], n_words: int) -> Optional[s
     trie = data["trie"]
     if trie.min_rank > n_words:
         return None
-    return trieto_regex(trie, n_limit=n_words, depth=0)
+    return trieto_regex(trie, nlimit=n_words, depth=0)
 
 
 import re  # after helper defs for reuse above
