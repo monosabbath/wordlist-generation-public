@@ -23,7 +23,6 @@ from dotenv import load_dotenv
 
 # Load environment as early as possible
 load_dotenv()
-
 from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
@@ -33,20 +32,6 @@ from transformers import (
     AutoTokenizer,
     pipeline,
 )
-
-# Assuming 'common.py' contains GenerateRequest. If not, define a placeholder.
-try:
-    from common import GenerateRequest
-except ImportError:
-    class GenerateRequest(BaseModel):
-        prompt: str
-        vocab_lang: Literal["en", "es"] = "en"
-        vocab_n_words: int = 1000
-        max_new_tokens: int = 100
-        num_beams: int = 1
-        repetition_penalty: float = 1.0
-        length_penalty: float = 1.0
-
 
 app = FastAPI()
 
@@ -77,7 +62,6 @@ model_init_kwargs = {
     "device_map": DEVICE_MAP,
     "trust_remote_code": TRUST_REMOTE_CODE,
 }
-
 print(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
@@ -103,19 +87,16 @@ print("Pipeline created.")
 @cache
 def get_stop_ids(tok: AutoTokenizer) -> list[int]:
     stop_ids: list[int] = []
-
     if tok.eos_token_id is not None:
         if isinstance(tok.eos_token_id, int):
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
-
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
         "<|im_end|>",
     )
-
     for special in common_end_markers:
         try:
             eid = tok.convert_tokens_to_ids(special)
@@ -123,25 +104,27 @@ def get_stop_ids(tok: AutoTokenizer) -> list[int]:
                 stop_ids.append(eid)
         except Exception:
             pass
-
     return list(set(stop_ids))
+
 
 # -----------------------
 # Regex-constrained vocab (lowercase-only, trie-based)
 # -----------------------
-
-def _normalize_word(w: str) -> str:
+def normalizeword(w: str) -> str:
     # Normalize Unicode and keep accents; enforce lowercase
     return unicodedata.normalize("NFC", w.strip()).lower()
 
+
 class _TrieNode:
-    __slots__ = ("children", "end", "min_rank")
+    slots = ("children", "end", "min_rank")
+
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
         self.min_rank: int = 10**12
 
-def _build_trie_with_ranks(words: list[str]) -> _TrieNode:
+
+def buildtrie_with_ranks(words: list[str]) -> _TrieNode:
     root = _TrieNode()
     for rank, w in enumerate(words, start=1):
         node = root
@@ -154,84 +137,84 @@ def _build_trie_with_ranks(words: list[str]) -> _TrieNode:
         node.end = True
     return root
 
-def _trie_to_regex(node: _TrieNode, n_limit: int, depth: int) -> str:
+
+def trieto_regex(node: _TrieNode, nlimit: int, depth: int) -> str:
     # Returns a regex for all suffixes from this node, pruned by n_limit.
     # It never returns an overall empty string at the root, but may include
     # empty as a suffix alternative at deeper nodes (to end a word).
     alts = []
-
     # Deterministic order for stable patterns
     for ch in sorted(node.children.keys()):
         child = node.children[ch]
-        if child.min_rank > n_limit:
+        if child.min_rank > nlimit:
             continue
-        sub = _trie_to_regex(child, n_limit, depth + 1)
-        head = re_escape = _escape_for_regex(ch)
+        sub = trieto_regex(child, nlimit, depth + 1)
+        head = re_escape = escapefor_regex(ch)
         alts.append(re_escape + sub)
-
     # If this node can terminate a word within the n_limit, allow empty suffix.
-    if node.end and node.min_rank <= n_limit:
+    if node.end and node.min_rank <= nlimit:
         alts.append("")
-
     if not alts:
         return ""
-
     if len(alts) == 1:
         return alts[0]
     return "(?:" + "|".join(alts) + ")"
 
-def _escape_for_regex(ch: str) -> str:
+
+def escapefor_regex(ch: str) -> str:
     # Escape as a literal outside of character classes
     import re
+
     return re.escape(ch)
 
-_TRIE_CACHE: Dict[str, Dict[str, Any]] = {}
 
-def _get_or_build_trie(lang: str) -> Optional[Dict[str, Any]]:
-    if lang in _TRIE_CACHE:
-        return _TRIE_CACHE[lang]
+TRIECACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
+    if lang in TRIECACHE:
+        return TRIECACHE[lang]
     filename = f"{lang}.txt"
     if not os.path.exists(filename):
         return None
     try:
         with open(filename, encoding="utf-8") as fin:
-            words = [_normalize_word(w) for w in fin if w.strip()]
+            words = [normalizeword(w) for w in fin if w.strip()]
     except Exception as e:
         print(f"Error reading language file {filename}: {e}")
         return None
     if not words:
         return None
-    trie = _build_trie_with_ranks(words)
-    _TRIE_CACHE[lang] = {"words": words, "trie": trie}
-    return _TRIE_CACHE[lang]
+    trie = buildtrie_with_ranks(words)
+    TRIECACHE[lang] = {"words": words, "trie": trie}
+    return TRIECACHE[lang]
 
-def _build_word_regex_for_n(lang: Literal["en", "es"], n_words: int) -> Optional[str]:
-    data = _get_or_build_trie(lang)
+
+def buildword_regex_for_n(lang: Literal["en", "es"], n_words: int) -> Optional[str]:
+    data = getor_build_trie(lang)
     if data is None:
         return None
     trie = data["trie"]
     if trie.min_rank > n_words:
         return None
-    return _trie_to_regex(trie, n_limit=n_words, depth=0)
+    return trieto_regex(trie, n_limit=n_words, depth=0)
+
 
 import re  # after helper defs for reuse above
+
 
 @cache
 def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     print(f"building prefix function for {lang} ({n_words} words)")
-
-    if _get_or_build_trie(lang) is None:
+    if getor_build_trie(lang) is None:
         print(f"Warning: Language file not found or empty: {lang}.txt. Skipping build.")
         return None
-
-    word_regex = _build_word_regex_for_n(lang, n_words)
+    word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         print(f"Warning: No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     # Punctuation between words; includes spaces/newlines and common Spanish punctuation
     punct_regex = r'[-.,!?():;¿¡«»"“”\'—–…\s]+'
-
     # Full-string grammar:
     # optional leading punctuation
     # word
@@ -239,7 +222,6 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     # optional trailing punctuation
     # Only non-capturing groups. Anchored.
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     stop_ids = set(get_stop_ids(tokenizer))
@@ -249,6 +231,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         return list(allowed | stop_ids)
 
     return wrapped_prefix_fn
+
 
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
@@ -273,20 +256,19 @@ def verify_token(
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
 
+
 # -----------------------
 # Helper for generation kwargs
 # -----------------------
-def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_beams=None, repetition_penalty=None, length_penalty=None, prefix_fn=None):
+def getgen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_beams=None, repetition_penalty=None, length_penalty=None, prefix_fn=None):
     """Helper to consolidate generation arguments."""
     do_sample = (temperature is None) or (temperature > 0)
-
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
         temperature=temperature if temperature is not None else 1.0,
         top_p=top_p if top_p is not None else 1.0,
     )
-
     if prefix_fn:
         gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
     if num_beams:
@@ -295,15 +277,14 @@ def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_be
         gen_kwargs["repetition_penalty"] = repetition_penalty
     if length_penalty:
         gen_kwargs["length_penalty"] = length_penalty
-
     if stop_ids:
         gen_kwargs["eos_token_id"] = stop_ids
         if tokenizer.pad_token_id is not None:
             gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
         else:
             gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
-
     return gen_kwargs
+
 
 # -----------------------
 # OpenAI-compatible API
@@ -311,6 +292,7 @@ def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_be
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+
 
 class ChatCompletionRequest(BaseModel):
     model: str
@@ -328,6 +310,7 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: Optional[float] = None
     length_penalty: Optional[float] = None
 
+
 @app.get("/v1/models")
 def list_models(auth_ok: bool = Depends(verify_token)):
     return {
@@ -341,6 +324,7 @@ def list_models(auth_ok: bool = Depends(verify_token)):
         ],
     }
 
+
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
     system_prompt = DEFAULT_SYSTEM_PROMPT_EN
@@ -348,7 +332,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role == "system":
             system_prompt = msg.content
             break
-
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
@@ -367,7 +350,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     texts = tokenizer.apply_chat_template(
         messages, **template_kwargs
     )
-
     inputs = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -383,7 +365,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     stop_ids = get_stop_ids(tokenizer)
 
-    gen_kwargs = _get_gen_kwargs(
+    gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
         temperature=req.temperature,
@@ -395,6 +377,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     )
 
     outputs = model.generate(**inputs, **gen_kwargs)
+
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
     prompt_tokens = int(inputs["input_ids"].shape[1])
@@ -421,11 +404,13 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     }
     return resp
 
+
 # ---------------------------------------------------
 # BATCH JOB API
 # ---------------------------------------------------
 
 JOB_STATUS: Dict[str, Dict[str, Any]] = {}
+
 
 def process_batch_job(
     job_id: str,
@@ -453,13 +438,11 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-
                 system_prompt = DEFAULT_SYSTEM_PROMPT_EN
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
@@ -473,7 +456,6 @@ def process_batch_job(
 
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
-
             except ValidationError as e:
                 print(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
@@ -481,7 +463,6 @@ def process_batch_job(
 
         # 3. Prepare shared generation kwargs for the entire batch job
         stop_ids = get_stop_ids(tokenizer)
-
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
@@ -556,6 +537,7 @@ def process_batch_job(
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
 
+
 # Endpoint 1: Submit a new batch job
 @app.post("/v1/batch/jobs")
 def create_batch_job(
@@ -615,19 +597,20 @@ def create_batch_job(
         "message": "Batch job accepted and queued for processing.",
     }
 
+
 # Endpoint 2: Check job status
 @app.get("/v1/batch/jobs/{job_id}")
 def get_batch_job_status(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     return {
         "job_id": job_id,
         "status": job["status"],
         "submitted_at": job["submitted_at"],
         "error": job.get("error"),
     }
+
 
 # Endpoint 3: Get job results
 @app.get("/v1/batch/jobs/{job_id}/results")
