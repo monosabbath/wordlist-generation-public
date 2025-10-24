@@ -1,12 +1,13 @@
 import os
 import time
 import uuid
-import json  # For reading/writing job files
-import tempfile  # For handling temp file locations
+import json
+import tempfile
+import unicodedata
 from functools import cache
 from typing import Literal, Optional, Dict, Any
 import torch
-from fastapi import (  # Added background tasks and file handling
+from fastapi import (
     Depends,
     FastAPI,
     HTTPException,
@@ -16,11 +17,11 @@ from fastapi import (  # Added background tasks and file handling
     File,
     BackgroundTasks,
 )
-from fastapi.responses import FileResponse  # To send the JSON file back
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
-# CHANGE 1: Load .env as early as possible, BEFORE other imports
+# Load environment as early as possible
 load_dotenv()
 
 from lmformatenforcer import RegexParser
@@ -30,14 +31,13 @@ from lmformatenforcer.integrations.transformers import (
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    pipeline,  # Import the pipeline
+    pipeline,
 )
 
 # Assuming 'common.py' contains GenerateRequest. If not, define a placeholder.
 try:
     from common import GenerateRequest
 except ImportError:
-    # Define placeholder based on usage in the script if common.py is missing
     class GenerateRequest(BaseModel):
         prompt: str
         vocab_lang: Literal["en", "es"] = "en"
@@ -88,25 +88,22 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_RE
 # -----------------------
 # Create the generation pipeline
 # -----------------------
-# We create the pipeline using the already-loaded model and tokenizer
 print("Creating text-generation pipeline...")
 text_gen_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    # device=model.device,  <-- THIS LINE IS REMOVED TO FIX ACCELERATE ERROR
     trust_remote_code=TRUST_REMOTE_CODE,
 )
 print("Pipeline created.")
 
-
 # -----------------------
 # Helpers for stop tokens
 # -----------------------
-@cache  # Cache this function call
+@cache
 def get_stop_ids(tok: AutoTokenizer) -> list[int]:
     stop_ids: list[int] = []
-    
+
     if tok.eos_token_id is not None:
         if isinstance(tok.eos_token_id, int):
             stop_ids.append(tok.eos_token_id)
@@ -126,44 +123,125 @@ def get_stop_ids(tok: AutoTokenizer) -> list[int]:
                 stop_ids.append(eid)
         except Exception:
             pass
-            
+
     return list(set(stop_ids))
 
 # -----------------------
-# Regex-constrained vocab
+# Regex-constrained vocab (lowercase-only, trie-based)
 # -----------------------
+
+def _normalize_word(w: str) -> str:
+    # Normalize Unicode and keep accents; enforce lowercase
+    return unicodedata.normalize("NFC", w.strip()).lower()
+
+class _TrieNode:
+    __slots__ = ("children", "end", "min_rank")
+    def __init__(self):
+        self.children: Dict[str, "_TrieNode"] = {}
+        self.end: bool = False
+        self.min_rank: int = 10**12
+
+def _build_trie_with_ranks(words: list[str]) -> _TrieNode:
+    root = _TrieNode()
+    for rank, w in enumerate(words, start=1):
+        node = root
+        node.min_rank = min(node.min_rank, rank)
+        for ch in w:
+            if ch not in node.children:
+                node.children[ch] = _TrieNode()
+            node = node.children[ch]
+            node.min_rank = min(node.min_rank, rank)
+        node.end = True
+    return root
+
+def _trie_to_regex(node: _TrieNode, n_limit: int, depth: int) -> str:
+    # Returns a regex for all suffixes from this node, pruned by n_limit.
+    # It never returns an overall empty string at the root, but may include
+    # empty as a suffix alternative at deeper nodes (to end a word).
+    alts = []
+
+    # Deterministic order for stable patterns
+    for ch in sorted(node.children.keys()):
+        child = node.children[ch]
+        if child.min_rank > n_limit:
+            continue
+        sub = _trie_to_regex(child, n_limit, depth + 1)
+        head = re_escape = _escape_for_regex(ch)
+        alts.append(re_escape + sub)
+
+    # If this node can terminate a word within the n_limit, allow empty suffix.
+    if node.end and node.min_rank <= n_limit:
+        alts.append("")
+
+    if not alts:
+        return ""
+
+    if len(alts) == 1:
+        return alts[0]
+    return "(?:" + "|".join(alts) + ")"
+
+def _escape_for_regex(ch: str) -> str:
+    # Escape as a literal outside of character classes
+    import re
+    return re.escape(ch)
+
+_TRIE_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def _get_or_build_trie(lang: str) -> Optional[Dict[str, Any]]:
+    if lang in _TRIE_CACHE:
+        return _TRIE_CACHE[lang]
+    filename = f"{lang}.txt"
+    if not os.path.exists(filename):
+        return None
+    try:
+        with open(filename, encoding="utf-8") as fin:
+            words = [_normalize_word(w) for w in fin if w.strip()]
+    except Exception as e:
+        print(f"Error reading language file {filename}: {e}")
+        return None
+    if not words:
+        return None
+    trie = _build_trie_with_ranks(words)
+    _TRIE_CACHE[lang] = {"words": words, "trie": trie}
+    return _TRIE_CACHE[lang]
+
+def _build_word_regex_for_n(lang: Literal["en", "es"], n_words: int) -> Optional[str]:
+    data = _get_or_build_trie(lang)
+    if data is None:
+        return None
+    trie = data["trie"]
+    if trie.min_rank > n_words:
+        return None
+    return _trie_to_regex(trie, n_limit=n_words, depth=0)
+
+import re  # after helper defs for reuse above
+
 @cache
 def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
     print(f"building prefix function for {lang} ({n_words} words)")
-    
-    filename = lang + ".txt"
-    if not os.path.exists(filename):
-        print(f"Warning: Language file not found: {filename}. Skipping build.")
+
+    if _get_or_build_trie(lang) is None:
+        print(f"Warning: Language file not found or empty: {lang}.txt. Skipping build.")
         return None
 
-    try:
-        with open(filename) as fin:
-            words = [word.strip().lower() for word in fin]
-    except Exception as e:
-        print(f"Error reading language file {filename}: {e}. Skipping build.")
+    word_regex = _build_word_regex_for_n(lang, n_words)
+    if not word_regex:
+        print(f"Warning: No words available for {lang} with n={n_words}. Skipping build.")
         return None
 
-    words = words[:n_words]
-    
-    if not words:
-        print(f"Warning: Vocabulary file {filename} is empty. Skipping build.")
-        return None
+    # Punctuation between words; includes spaces/newlines and common Spanish punctuation
+    punct_regex = r'[-.,!?():;¿¡«»"“”\'—–…\s]+'
 
-    word_regexp = "|".join(
-        "[" + w[0].lower() + w[0].upper() + "]" + w[1:] for w in words if w
-    )
-    word_regexp = "(" + word_regexp + ")"
-    punct_regexp = "[-.,!?():;¿!¡\\s]+"
-    flexible_grammar = f"({word_regexp}{punct_regexp})+"
+    # Full-string grammar:
+    # optional leading punctuation
+    # word
+    # (punct + word)* zero or more
+    # optional trailing punctuation
+    # Only non-capturing groups. Anchored.
+    flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -172,10 +250,9 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
 
     return wrapped_prefix_fn
 
-
 if PREBUILD_PREFIX:
     print("prebuilding prefix functions...")
-    for lang in ("es",): # Only checking 'es' as in original
+    for lang in ("es",):  # Prebuild for Spanish; adjust as needed
         for n_words in PREBUILD_WORD_COUNTS:
             build_regexp_prefix_fn(lang, n_words)
     print("done")
@@ -202,7 +279,7 @@ def verify_token(
 def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_beams=None, repetition_penalty=None, length_penalty=None, prefix_fn=None):
     """Helper to consolidate generation arguments."""
     do_sample = (temperature is None) or (temperature > 0)
-    
+
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=do_sample,
@@ -222,10 +299,10 @@ def _get_gen_kwargs(max_new_tokens, stop_ids, temperature=1.0, top_p=1.0, num_be
     if stop_ids:
         gen_kwargs["eos_token_id"] = stop_ids
         if tokenizer.pad_token_id is not None:
-             gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
+            gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
         else:
-             gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
-            
+            gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
+
     return gen_kwargs
 
 # -----------------------
@@ -290,7 +367,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     texts = tokenizer.apply_chat_template(
         messages, **template_kwargs
     )
-    
+
     inputs = tokenizer(texts, return_tensors="pt", max_length=1024, truncation=True).to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
@@ -298,12 +375,12 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
         if prefix_fn is None:
-             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
+            raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
 
     max_new_from_request = req.max_tokens if req.max_tokens is not None else 100
     allowed_new_tokens = 1024 - input_len
     max_new_tokens = max(0, min(max_new_from_request, allowed_new_tokens))
-    
+
     stop_ids = get_stop_ids(tokenizer)
 
     gen_kwargs = _get_gen_kwargs(
@@ -344,27 +421,18 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     }
     return resp
 
-
 # ---------------------------------------------------
 # BATCH JOB API
 # ---------------------------------------------------
 
-# In-memory store for job statuses.
-# For production, you would replace this with Redis, a database, or similar.
 JOB_STATUS: Dict[str, Dict[str, Any]] = {}
 
-# The background worker function
 def process_batch_job(
     job_id: str,
     input_path: str,
     output_path: str,
     job_config: Dict[str, Any],
 ):
-    """
-    This function runs in the background.
-    It loads the input file, processes all requests using the pipeline,
-    and saves the results to the output file.
-    """
     print(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
@@ -384,10 +452,8 @@ def process_batch_job(
         print(f"[Job {job_id}] Preparing {len(raw_requests)} prompts...")
         for i, req_data in enumerate(raw_requests):
             try:
-                # Validate that it's a valid request object
                 req = ChatCompletionRequest(**req_data)
 
-                # Use the *exact same* templating logic as the single endpoint
                 system_prompt = DEFAULT_SYSTEM_PROMPT_EN
                 for msg in req.messages:
                     if msg.role == "system":
@@ -412,13 +478,12 @@ def process_batch_job(
                 print(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
                 print(f"[Job {job_id}] Skipping request {i}: Error processing. {e}")
-        
-        # 3. Prepare shared generation kwargs for the *entire* batch job
+
+        # 3. Prepare shared generation kwargs for the entire batch job
         stop_ids = get_stop_ids(tokenizer)
-        
-        # We need to set eos_token_id and pad_token_id for the pipeline
+
         if tokenizer.pad_token_id is None:
-             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
+            tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
         generation_kwargs = dict(
             max_new_tokens=job_config.get("max_tokens", 100),
@@ -442,20 +507,17 @@ def process_batch_job(
                 generation_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
                 print(f"[Job {job_id}] Successfully added prefix function.")
             else:
-                # Vocab file was missing or empty, fail the job
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-
-        # 4. Run the pipeline!
+        # 4. Run the pipeline
         print(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
         results = []
         for output in text_gen_pipeline(
             prompts,
             batch_size=BATCH_JOB_PIPELINE_SIZE,
-            return_full_text=False,  # <-- IMPORTANT: Only get the *new* text
-            **generation_kwargs, # This will now include prefix_fn
+            return_full_text=False,
+            **generation_kwargs,
         ):
-            # output is like [{'generated_text': '...'}]
             results.append(output[0]["generated_text"])
 
         # 5. Format and save the output file
@@ -486,7 +548,6 @@ def process_batch_job(
         with open(output_path, "w") as f:
             json.dump(final_output, f, indent=2)
 
-        # 6. Mark job as completed
         JOB_STATUS[job_id]["status"] = "completed"
         print(f"[Job {job_id}] Processing complete.")
 
@@ -495,21 +556,18 @@ def process_batch_job(
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
 
-
 # Endpoint 1: Submit a new batch job
 @app.post("/v1/batch/jobs")
 def create_batch_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
-    # You can add query params to configure the *entire* job
     max_tokens: int = 100,
     temperature: float = 0.7,
     top_p: float = 1.0,
     num_beams: int = 1,
     repetition_penalty: float = 1.0,
     length_penalty: float = 1.0,
-    # --- ADDED THESE PARAMETERS ---
     vocab_lang: Optional[Literal["en", "es"]] = None,
     vocab_n_words: Optional[int] = None,
 ):
@@ -557,22 +615,19 @@ def create_batch_job(
         "message": "Batch job accepted and queued for processing.",
     }
 
-
 # Endpoint 2: Check job status
 @app.get("/v1/batch/jobs/{job_id}")
 def get_batch_job_status(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    
-    # Return a subset of the info
+
     return {
         "job_id": job_id,
         "status": job["status"],
         "submitted_at": job["submitted_at"],
-        "error": job.get("error"), # Will be None if no error
+        "error": job.get("error"),
     }
-
 
 # Endpoint 3: Get job results
 @app.get("/v1/batch/jobs/{job_id}/results")
@@ -587,8 +642,6 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
             raise HTTPException(
                 status_code=500, detail="Job completed but output file is missing."
             )
-        
-        # Return the JSON file as a downloadable response
         return FileResponse(
             path=output_path,
             media_type="application/json",
