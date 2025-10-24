@@ -228,7 +228,7 @@ def build_regexp_prefix_fn(lang: Literal["en", "es"], n_words: int):
         print(f"Warning: No words available for {lang} with n={n_words}. Skipping build.")
         return None
     # Punctuation between words; includes spaces/newlines and common Spanish punctuation
-    punct_regex = r'[-.,!?():;¿¡«»"“”\'—–…\s]+'
+    punct_regex = r'[.,!?¿¡…\s]+'
     # Full-string grammar:
     # optional leading punctuation
     # word
