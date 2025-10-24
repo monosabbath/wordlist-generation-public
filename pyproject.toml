@@ -24,11 +24,9 @@ dependencies = [
     # ADDED: Required for FP8 models like zai-org/GLM-4.6-FP8
     "compressed-tensors",
 ]
-
 [dependency-groups]
 dev = [
     "ruff",
 ]
-
 [tool.setuptools]
-py-modules = ["client", "common", "server"]
+py-modules = ["server"]
