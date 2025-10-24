@@ -48,6 +48,7 @@ PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "500,1000,5000").split(",")
 )
+TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 
 # Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
@@ -58,9 +59,22 @@ print(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 # -----------------------
 # Model / tokenizer load
 # -----------------------
+
+# Determine torch_dtype from environment variable
+if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
+    TORCH_DTYPE = torch.bfloat16
+    print(f"Using torch_dtype: bfloat16")
+elif TORCH_DTYPE_STR.lower() in ("fp16", "float16", "torch.float16"):
+    TORCH_DTYPE = torch.float16
+    print(f"Using torch_dtype: float16")
+else:
+    TORCH_DTYPE = "auto"
+    print(f"Using torch_dtype: auto")
+
 model_init_kwargs = {
     "device_map": DEVICE_MAP,
     "trust_remote_code": TRUST_REMOTE_CODE,
+    "torch_dtype": TORCH_DTYPE,
 }
 print(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
 model = AutoModelForCausalLM.from_pretrained(
