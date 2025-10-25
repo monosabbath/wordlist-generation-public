@@ -1,32 +1,29 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
-description = "Add your description here"
+description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "accelerate",
-    "click",
     "fastapi[standard]",
     "httpx",
-    "lm-format-enforcer",
-    "openai",
-    "pydantic",
-    "torch",
-    "transformers",
+    "lm-format-enforcer>=0.10.0",  # ensure integrations module is present
+    "pydantic>=2",
     "python-dotenv",
-    # If you plan to use 8-bit or 4-bit quantization, uncomment the next line:
-    "bitsandbytes",
-    # ADDED: Required by Kimi-K2 tokenizer
-    "tiktoken",
-    # ADDED: High-performance event loop seen in traceback
-    "uvloop",
-    # ADDED: Required for FP8 models like zai-org/GLM-4.6-FP8
+    "safetensors",                  # recommended for HF models
+    "torch",                        # pin per your CUDA/PyTorch stack if needed
+    "transformers",                 # consider a range pin in prod, e.g. >=4.44,<4.46
+    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "compressed-tensors",
+    "tiktoken",
+    "sentencepiece",
 ]
+
 [dependency-groups]
 dev = [
     "ruff",
 ]
+
 [tool.setuptools]
 py-modules = ["server"]
