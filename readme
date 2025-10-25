@@ -1,3 +1,6 @@
+chmod +x setup.sh
+./setup.sh
+
 uv run uvicorn server:app --host 0.0.0.0 --port 8010
 
 # This job will use num_beams=4 AND the Spanish vocab with 1000 words
