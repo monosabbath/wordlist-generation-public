@@ -3,8 +3,8 @@
 set -e
 
 echo "--- 1. Updating system packages and installing nano ---"
-# We combine update and install into one line
-sudo apt-get update && sudo apt-get install -y nano
+apt-get update
+apt-get install -y nano
 
 echo "--- 2. Installing uv package manager (globally) ---"
 pip install uv
