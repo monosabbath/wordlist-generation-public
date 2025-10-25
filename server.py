@@ -49,7 +49,7 @@ app = FastAPI()
 # Config via environment
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")
+DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")  # e.g., "cuda" or "auto"
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 
@@ -65,6 +65,7 @@ TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 # Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
+
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 
@@ -87,14 +88,41 @@ model_init_kwargs = {
     "trust_remote_code": TRUST_REMOTE_CODE,
     "torch_dtype": TORCH_DTYPE,
 }
-
 logger.info(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     **model_init_kwargs,
 )
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 model.eval()
+
+# -----------------------
+# Helpers
+# -----------------------
+def is_sharded_model(m) -> bool:
+    # True when loaded with accelerate dispatch (device_map="auto" etc.)
+    return getattr(m, "hf_device_map", None) is not None
+
+def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], m):
+    # Universal safe rule:
+    # - If model is sharded (multi-GPU dispatch), keep inputs on CPU; dispatch will handle it.
+    # - Otherwise, move to the model's parameter device.
+    if is_sharded_model(m):
+        return inputs
+    # Non-sharded model case
+    try:
+        device = next(m.parameters()).device
+    except StopIteration:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return {k: v.to(device) for k, v in inputs.items()}
+
+def tokenizer_encode_for_chat(text: str) -> Dict[str, torch.Tensor]:
+    # Conditionally disable token_type_ids for GLM-4.6-FP8 only
+    tok_kwargs = {"return_tensors": "pt"}
+    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
+        tok_kwargs["return_token_type_ids"] = False
+    return tokenizer(text, **tok_kwargs)
 
 # -----------------------
 # Create the generation pipeline
@@ -119,7 +147,6 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
-
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -193,24 +220,19 @@ def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     if not _safe_lang_name(lang):
         logger.warning(f"Unsafe or invalid language identifier: {lang}")
         return None
-
     if lang in TRIECACHE:
         return TRIECACHE[lang]
-
     filename = f"{lang}.txt"
     if not os.path.exists(filename):
         return None
-
     try:
         with open(filename, encoding="utf-8") as fin:
             words = [normalizeword(w) for w in fin if w.strip()]
     except Exception as e:
         logger.error(f"Error reading language file {filename}: {e}")
         return None
-
     if not words:
         return None
-
     trie = buildtrie_with_ranks(words)
     # Store only the trie to reduce memory footprint
     TRIECACHE[lang] = {"trie": trie}
@@ -235,21 +257,17 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     # Punctuation between words; includes spaces/newlines and common punctuation
     punct_regex = r'[.,!?¿¡…\s]+'
     # Full-string grammar (not anchored, per user preference)
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
     stop_ids = set(get_stop_ids(tokenizer))
-
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         # Ensure EOS is always allowed
         return list(allowed | stop_ids)
-
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested)
@@ -366,7 +384,15 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)
 
-    inputs = tokenizer(texts, return_tensors="pt").to(model.device)
+    # Conditionally suppress token_type_ids only for GLM-4.6-FP8
+    tok_kwargs = {"return_tensors": "pt"}
+    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
+        tok_kwargs["return_token_type_ids"] = False
+    inputs = tokenizer(texts, **tok_kwargs)
+
+    # Universal sharding-safe device handling
+    inputs = move_inputs_to_correct_device(inputs, model)
+
     input_len = inputs["input_ids"].shape[1]
 
     prefix_fn = None
@@ -395,6 +421,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
 
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
     created = int(time.time())
@@ -433,7 +460,6 @@ def process_batch_job(
     logger.info(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
-
         # 1. Read and parse the input file
         prompts = []
         raw_requests = []
@@ -450,25 +476,21 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-
                 # Only use system prompt provided in API request
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
-
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 if MODEL_NAME == "zai-org/GLM-4.6-FP8":
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
             except ValidationError as e:
@@ -504,11 +526,17 @@ def process_batch_job(
 
         # 4. Run the pipeline
         logger.info(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
+
+        # Conditionally suppress token_type_ids only for GLM-4.6-FP8
+        pipeline_kwargs = {"return_full_text": False}
+        if MODEL_NAME == "zai-org/GLM-4.6-FP8":
+            pipeline_kwargs["return_token_type_ids"] = False
+
         results = []
         for output in text_gen_pipeline(
             prompts,
             batch_size=BATCH_JOB_PIPELINE_SIZE,
-            return_full_text=False,
+            **pipeline_kwargs,
             **generation_kwargs,
         ):
             results.append(output[0]["generated_text"])
