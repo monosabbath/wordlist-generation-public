@@ -1,6 +1,6 @@
 [project]
 name = "wordlist-generation"
-version = "0.2.0"
+version = "0.2.1"
 description = "Vocabulary-constrained generation server (FastAPI + TensorRT-LLM + lm-format-enforcer)"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -13,8 +13,8 @@ dependencies = [
     "transformers>=4.44",
     "tiktoken",
     "sentencepiece",
-    "numpy<2",        # pin to avoid NumPy 2.x ABI mismatch
-    "PyYAML>=6.0",    # to parse parallel_config.yaml
+    "numpy<2",
+    "PyYAML>=6.0",
 ]
 
 [dependency-groups]
