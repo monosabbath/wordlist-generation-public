@@ -45,7 +45,6 @@ from transformers import AutoTokenizer
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("vocab-constrained-trtllm")
-
 app = FastAPI()
 
 # -----------------------
@@ -80,7 +79,6 @@ logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_
 # Model / tokenizer load
 # -----------------------
 logger.info(f"Loading TRT-LLM model '{MODEL_NAME}' ...")
-
 kv_cfg = None
 if KV_CACHE_DTYPE == "fp8":
     kv_cfg = KvCacheConfig(dtype="fp8")
@@ -118,7 +116,6 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
         moe_ep = cfg.get("moe_expert_parallel_size") or cfg.get("moe_ep")
         gpn = cfg.get("gpus_per_node")
         enable_attention_dp = bool(cfg.get("enable_attention_dp", False))
-
         llm_kwargs.update(
             tensor_parallel_size=int(tp),
             pipeline_parallel_size=int(pp),
@@ -131,7 +128,6 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
             llm_kwargs["moe_expert_parallel_size"] = int(moe_ep)
         if gpn is not None:
             llm_kwargs["gpus_per_node"] = int(gpn)
-
         logger.info(
             f"LLM parallel settings -> TP={llm_kwargs.get('tensor_parallel_size', 1)}, "
             f"PP={llm_kwargs.get('pipeline_parallel_size', 1)}, "
@@ -171,7 +167,6 @@ def ensure_trt_runtime_ready():
 
 # Proactively warm up runtime to avoid first-request latency and None runtime_context
 ensure_trt_runtime_ready()
-
 logger.info(
     "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -372,7 +367,8 @@ def build_runtime_sampling_config(
 ) -> RuntimeSamplingConfig:
     eos = get_eos_id()
     pad = get_pad_id()
-    nb = max(1, int(num_beams or 1))
+    # Enforce TRT-LLM requirement: request beam width == configured max_beam_width
+    nb = MAX_BEAM_WIDTH
     # Beam search: enforce temperature 0.0; greedy (nb=1) uses temperature 1.0
     temperature = 0.0 if nb > 1 else 1.0
     top_k = 1
@@ -400,20 +396,17 @@ def trt_runtime_generate_texts(
     rt_ctx = getattr(llm, "runtime_context", None)
     if rt_ctx is None or getattr(rt_ctx, "runtime", None) is None:
         raise RuntimeError("TRT-LLM runtime is not initialized. See logs for warmup failures.")
-
     tokenizer = _runtime_tokenizer()
     # Encode batch
     enc = tokenizer.batch_encode_plus(prompts)
     batch_enc = enc["input_ids"]
     inputs = torch.LongTensor(batch_enc)
-
     # Call the low-level runtime API with logits_processor
     out = rt_ctx.runtime.generate(
         inputs,
         sampling_config=runtime_sampling_config,
         logits_processor=logits_processor,
     )
-
     # Decode only the newly generated tokens per item (beam 0)
     texts: List[str] = []
     output_ids = out["output_ids"]
@@ -436,7 +429,8 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     vocab_lang: str
     vocab_n_words: int
-    num_beams: Optional[int] = 1
+    # Default to MAX_BEAM_WIDTH; if provided and mismatched, we will coerce to MAX_BEAM_WIDTH.
+    num_beams: Optional[int] = None
     length_penalty: Optional[float] = 1.0
 
 @app.get("/v1/models")
@@ -473,9 +467,17 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         )
 
     max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 128
+
+    # Resolve num_beams; coerce to MAX_BEAM_WIDTH to satisfy TRT-LLM assertion
+    requested_beams = int(req.num_beams) if req.num_beams is not None else MAX_BEAM_WIDTH
+    if requested_beams != MAX_BEAM_WIDTH:
+        logger.warning(
+            f"Request num_beams={requested_beams} differs from MAX_BEAM_WIDTH={MAX_BEAM_WIDTH}. "
+            f"Coercing to {MAX_BEAM_WIDTH} to satisfy TRT-LLM."
+        )
     runtime_cfg = build_runtime_sampling_config(
         max_new_tokens=max_new_tokens,
-        num_beams=int(req.num_beams or 1),
+        num_beams=MAX_BEAM_WIDTH,
         length_penalty=float(req.length_penalty if req.length_penalty is not None else 1.0),
     )
 
@@ -543,7 +545,12 @@ def process_batch_job(
             raise ValueError("No valid requests in batch.")
 
         max_tokens = int(job_config.get("max_tokens", 128))
-        num_beams = int(job_config.get("num_beams", 1))
+        requested_num_beams = int(job_config.get("num_beams", MAX_BEAM_WIDTH))
+        if requested_num_beams != MAX_BEAM_WIDTH:
+            logger.warning(
+                f"[Job {job_id}] Requested num_beams={requested_num_beams} differs from MAX_BEAM_WIDTH={MAX_BEAM_WIDTH}. "
+                f"Coercing to {MAX_BEAM_WIDTH} to satisfy TRT-LLM."
+            )
         length_penalty = float(job_config.get("length_penalty", 1.0))
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
@@ -553,7 +560,8 @@ def process_batch_job(
         # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
         ensure_trt_runtime_ready()
 
-        runtime_cfg = build_runtime_sampling_config(max_tokens, num_beams, length_penalty)
+        runtime_cfg = build_runtime_sampling_config(max_tokens, MAX_BEAM_WIDTH, length_penalty)
+
         logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
         logits_processor = build_logits_processor_for(vocab_lang, int(vocab_n_words))
         if logits_processor is None:
@@ -608,7 +616,8 @@ def create_batch_job(
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
     max_tokens: int = 128,
-    num_beams: int = 1,
+    # Default num_beams to MAX_BEAM_WIDTH to satisfy TRT-LLM assertion
+    num_beams: int = MAX_BEAM_WIDTH,
     length_penalty: float = 1.0,
     vocab_lang: Optional[str] = None,
     vocab_n_words: Optional[int] = None,
@@ -642,9 +651,7 @@ def create_batch_job(
         "submitted_at": int(time.time()),
         "config": job_config,
     }
-
     background_tasks.add_task(process_batch_job, job_id, input_path, output_path, job_config)
-
     return {
         "job_id": job_id,
         "status": "pending",
