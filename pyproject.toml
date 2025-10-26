@@ -16,9 +16,7 @@ dependencies = [
     "numpy<2",
     "PyYAML>=6.0",
 ]
-
 [dependency-groups]
 dev = ["ruff"]
-
 [tool.setuptools]
 py-modules = ["server"]
