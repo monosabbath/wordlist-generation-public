@@ -351,32 +351,34 @@ def build_sampling_params(
 ) -> SamplingParams:
     eos = get_eos_id()
     pad = get_pad_id()
+
     # Clamp to engine caps
-    max_new_tokens = int(max(1, min(max_new_tokens, MAX_NUM_TOKENS)))
+    max_tokens = int(max(1, min(max_new_tokens, MAX_NUM_TOKENS)))
     num_beams = int(num_beams or 1)
     num_beams = max(1, min(num_beams, MAX_BEAM_WIDTH))
 
+    kwargs = dict(
+        end_id=eos,
+        pad_id=pad,
+        max_tokens=max_tokens,           # <- TRT-LLM 1.0 uses max_tokens
+        length_penalty=float(length_penalty),
+    )
+
     if num_beams > 1:
-        sp = SamplingParams(
-            end_id=eos,
-            pad_id=pad,
-            max_new_tokens=max_new_tokens,
-            use_beam_search=True,
-            best_of=num_beams,
-            n=1,
-            length_penalty=float(length_penalty),
+        # Beam search in TRT-LLM 1.0 is via beam_width
+        kwargs.update(
+            beam_width=num_beams,
+            temperature=0.0,              # common for deterministic beams
         )
     else:
-        sp = SamplingParams(
-            end_id=eos,
-            pad_id=pad,
-            max_new_tokens=max_new_tokens,
+        # Greedy (deterministic) or simple sampling; adjust as you like
+        kwargs.update(
             temperature=1.0,
             top_k=1,
             top_p=0.0,
-            length_penalty=float(length_penalty),
         )
-    return sp
+
+    return SamplingParams(**kwargs)
 
 def _extract_text_from_generate_output(o: Any) -> str:
     # Try common TRT-LLM output shapes
