@@ -353,25 +353,32 @@ def build_sampling_params(
     pad = get_pad_id()
 
     # Clamp to engine caps
-    max_tokens = int(max(1, min(max_new_tokens, MAX_NUM_TOKENS)))
-    num_beams = int(num_beams or 1)
-    num_beams = max(1, min(num_beams, MAX_BEAM_WIDTH))
+    max_tokens = int(max(1, min(max_new_tokens or 1, MAX_NUM_TOKENS)))
+    nb = int(num_beams or 1)
 
+    # Base kwargs
     kwargs = dict(
         end_id=eos,
         pad_id=pad,
-        max_tokens=max_tokens,           # <- TRT-LLM 1.0 uses max_tokens
+        max_tokens=max_tokens,            # TRT-LLM 1.0 uses max_tokens
         length_penalty=float(length_penalty),
     )
 
-    if num_beams > 1:
-        # Beam search in TRT-LLM 1.0 is via beam_width
+    if nb > 1:
+        # TRT-LLM 1.0 docs: best_of must equal LLM.max_beam_width
+        if nb != MAX_BEAM_WIDTH:
+            logger.warning(
+                "num_beams (%s) != MAX_BEAM_WIDTH (%s); enforcing best_of=%s as required by TRT-LLM 1.0.",
+                nb, MAX_BEAM_WIDTH, MAX_BEAM_WIDTH
+            )
         kwargs.update(
-            beam_width=num_beams,
-            temperature=0.0,              # common for deterministic beams
+            use_beam_search=True,
+            best_of=MAX_BEAM_WIDTH,       # must equal LLM.max_beam_width
+            n=1,                          # we return a single sequence
+            temperature=0.0,              # typical for deterministic beams
         )
     else:
-        # Greedy (deterministic) or simple sampling; adjust as you like
+        # Greedy/sampling
         kwargs.update(
             temperature=1.0,
             top_k=1,
