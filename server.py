@@ -45,13 +45,14 @@ from transformers import AutoTokenizer
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("vocab-constrained-trtllm")
+
 app = FastAPI()
 
 # -----------------------
 # Config via environment
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
+SECRET_TOKEN = os.getenv("SECRET_TOKEN", "changeme")
 
 # Constrained vocab prebuild config
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
@@ -82,6 +83,7 @@ logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_
 # Model / tokenizer load
 # -----------------------
 logger.info(f"Loading TRT-LLM model '{MODEL_NAME}' ...")
+
 kv_cfg = None
 if KV_CACHE_DTYPE == "fp8":
     kv_cfg = KvCacheConfig(dtype="fp8")
@@ -148,54 +150,43 @@ else:
 llm = LLM(**llm_kwargs)
 
 # -----------------------
-# Warmup helper (to create runtime once)
+# Warmup helper (runtime-only)
 # -----------------------
 def ensure_trt_runtime_ready():
-    # Lazily initialize the TRT-LLM runtime so llm.runtime_context is not None.
-    if getattr(llm, "runtime_context", None) is None or getattr(llm.runtime_context, "runtime", None) is None:
-        # Try convenience generate() with num_beams/beam_width to match engine
-        try:
-            llm.generate(" ", max_new_tokens=1, num_beams=NUM_BEAMS)
-            logger.info("TRT-LLM warmup: runtime initialized using generate(num_beams)")
-            return
-        except TypeError:
-            pass
-        except AssertionError as e:
-            logger.warning(f"Warmup via generate(num_beams) hit assertion: {e}")
+    # Already ready?
+    if getattr(llm, "runtime_context", None) is not None and getattr(llm.runtime_context, "runtime", None) is not None:
+        return
 
-        try:
-            llm.generate(" ", max_new_tokens=1, beam_width=NUM_BEAMS)  # some builds use 'beam_width'
-            logger.info("TRT-LLM warmup: runtime initialized using generate(beam_width)")
-            return
-        except TypeError:
-            pass
-        except AssertionError as e:
-            logger.warning(f"Warmup via generate(beam_width) hit assertion: {e}")
+    # Prefer warming up with the configured beam size first (older TRT-LLM may assert if beams mismatch)
+    if NUM_BEAMS and NUM_BEAMS > 1:
+        for arg_name in ("beam_width", "num_beams"):
+            try:
+                llm.generate(" ", max_new_tokens=1, **{arg_name: NUM_BEAMS})
+                logger.info(f"TRT-LLM warmup: runtime initialized using generate({arg_name}={NUM_BEAMS})")
+                return
+            except AssertionError as e:
+                logger.warning(f"Warmup via generate({arg_name}={NUM_BEAMS}) hit assertion: {e}")
+            except TypeError:
+                # This build doesn't accept that kw name; try the next
+                pass
+            except Exception as e:
+                logger.warning(f"Warmup via generate({arg_name}={NUM_BEAMS}) failed: {e}")
 
-        # Fall back to explicit LLM API SamplingParams for older/newer versions
-        try:
-            from tensorrt_llm.llmapi import SamplingParams as LLMAPISamplingParams  # type: ignore
-            last_exc = None
-            for kw in (
-                dict(max_tokens=1, beam_width=NUM_BEAMS),
-                dict(max_tokens=1, num_beams=NUM_BEAMS),
-            ):
-                try:
-                    llm.generate(" ", LLMAPISamplingParams(**kw))
-                    logger.info(f"TRT-LLM warmup: runtime initialized using LLMAPISamplingParams {kw}")
-                    return
-                except Exception as e:
-                    last_exc = e
-            if last_exc:
-                raise last_exc
-        except Exception as e2:
-            logger.warning(f"TRT-LLM warmup via LLMAPISamplingParams failed: {e2}")
+    # Beam-agnostic warmup (works across many versions; may default to greedy=1)
+    try:
+        llm.generate(" ", max_new_tokens=1)
+        logger.info("TRT-LLM warmup: runtime initialized using generate(no-beam-args)")
+        return
+    except Exception as e:
+        logger.warning(f"Warmup (no-beam-args) failed: {e}")
 
-        # If all fail, log a warning; runtime may still initialize on first request
-        logger.warning("TRT-LLM warmup did not complete; runtime will initialize on first request.")
+    logger.warning("TRT-LLM warmup did not complete; runtime will initialize on first request.")
 
-# Proactively warm up runtime to avoid first-request latency and None runtime_context
-ensure_trt_runtime_ready()
+# Proactively warm up runtime on startup to avoid first-request latency and None runtime_context
+@app.on_event("startup")
+def _startup_init():
+    ensure_trt_runtime_ready()
+
 logger.info(
     "TRT-LLM limits -> batch=%s, num_beams=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, NUM_BEAMS, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -213,9 +204,8 @@ def _runtime_tokenizer():
     # Prefer TRT-LLM runtime tokenizer if runtime is initialized;
     # otherwise fall back to the HF tokenizer.
     ctx = getattr(llm, "runtime_context", None)
-    if ctx is not None and getattr(ctx, "tokenizer", None) is not None:
-        return ctx.tokenizer
-    return chat_tokenizer
+    tok = getattr(ctx, "tokenizer", None) if ctx is not None else None
+    return tok or chat_tokenizer
 
 @cache
 def get_eos_id() -> int:
@@ -325,7 +315,7 @@ def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
     return fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
 def build_logits_processor_for(lang: str, n_words: int):
-    # Ensure runtime is ready so we prefer TRT tokenizer if available
+    # Ensure runtime is ready so we can prefer TRT tokenizer if available
     ensure_trt_runtime_ready()
     grammar = build_regex_grammar(lang, n_words)
     if not grammar:
@@ -398,20 +388,29 @@ def build_runtime_sampling_config(
     nb = NUM_BEAMS
     # Beam search: enforce temperature 0.0; greedy (nb=1) uses temperature 1.0
     temperature = 0.0 if nb > 1 else 1.0
-    top_k = 1
-    top_p = 0.0
-    return RuntimeSamplingConfig(
+
+    base_kwargs = dict(
         end_id=eos,
         pad_id=pad,
         max_new_tokens=int(max_new_tokens),
-        num_beams=nb,
         temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
+        top_k=1,
+        top_p=0.0,
         length_penalty=float(length_penalty),
         early_stopping=1,
         use_beam_hyps=True,
     )
+
+    # Prefer num_beams; fall back to beam_width if needed; else default (greedy=1)
+    try:
+        return RuntimeSamplingConfig(**base_kwargs, num_beams=nb)
+    except TypeError:
+        pass
+    try:
+        return RuntimeSamplingConfig(**base_kwargs, beam_width=nb)
+    except TypeError:
+        logger.warning("RuntimeSamplingConfig does not accept num_beams/beam_width; defaulting to greedy.")
+        return RuntimeSamplingConfig(**base_kwargs)
 
 def trt_runtime_generate_texts(
     prompts: List[str],
@@ -422,18 +421,38 @@ def trt_runtime_generate_texts(
     ensure_trt_runtime_ready()
     rt_ctx = getattr(llm, "runtime_context", None)
     if rt_ctx is None or getattr(rt_ctx, "runtime", None) is None:
+        # Last-chance lazy init
+        try:
+            llm.generate(" ", max_new_tokens=1)
+        except Exception as e:
+            logger.warning(f"Lazy runtime init via llm.generate failed: {e}")
+        rt_ctx = getattr(llm, "runtime_context", None)
+
+    if rt_ctx is None or getattr(rt_ctx, "runtime", None) is None:
         raise RuntimeError("TRT-LLM runtime is not initialized. See logs for warmup failures.")
+
     tokenizer = _runtime_tokenizer()
+
     # Encode batch
     enc = tokenizer.batch_encode_plus(prompts)
     batch_enc = enc["input_ids"]
     inputs = torch.LongTensor(batch_enc)
-    # Call the low-level runtime API with logits_processor
-    out = rt_ctx.runtime.generate(
-        inputs,
-        sampling_config=runtime_sampling_config,
-        logits_processor=logits_processor,
-    )
+
+    # Call the low-level runtime API with logits processor
+    # Some builds expect logits_processor, others logits_processors
+    try:
+        out = rt_ctx.runtime.generate(
+            inputs,
+            sampling_config=runtime_sampling_config,
+            logits_processor=logits_processor,
+        )
+    except TypeError:
+        out = rt_ctx.runtime.generate(
+            inputs,
+            sampling_config=runtime_sampling_config,
+            logits_processors=[logits_processor],
+        )
+
     # Decode only the newly generated tokens per item (beam 0)
     texts: List[str] = []
     output_ids = out["output_ids"]
@@ -473,7 +492,7 @@ def list_models(auth_ok: bool = Depends(verify_token)):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
-    # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
+    # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer when available
     ensure_trt_runtime_ready()
 
     # Require constrained config
@@ -538,7 +557,6 @@ def process_batch_job(
     logger.info(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
-
         with open(input_path, "r", encoding="utf-8") as f:
             raw_requests = json.load(f)
         if not isinstance(raw_requests, list):
@@ -569,7 +587,6 @@ def process_batch_job(
 
         # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
         ensure_trt_runtime_ready()
-
         runtime_cfg = build_runtime_sampling_config(max_tokens, length_penalty)
 
         logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
@@ -608,6 +625,7 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
+
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
@@ -650,7 +668,6 @@ def create_batch_job(
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
     }
-
     JOB_STATUS[job_id] = {
         "status": "pending",
         "input_path": input_path,
@@ -658,7 +675,9 @@ def create_batch_job(
         "submitted_at": int(time.time()),
         "config": job_config,
     }
+
     background_tasks.add_task(process_batch_job, job_id, input_path, output_path, job_config)
+
     return {
         "job_id": job_id,
         "status": "pending",
