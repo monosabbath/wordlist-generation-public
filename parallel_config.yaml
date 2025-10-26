@@ -1,6 +1,14 @@
-# Example: single-GPU or simple setup
+# Tensor/pipe/context sizes
 tensor_parallel_size: 1
-moe_expert_parallel_size: 1
-moe_tensor_parallel_size: 1
-enable_attention_dp: false
+pipeline_parallel_size: 1
 context_parallel_size: 1
+
+# MoE sizes (if using an MoE model)
+moe_tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+
+# Attention DP (beta)
+enable_attention_dp: false
+
+# Optional: GPUs per node (for multi-node setups)
+# gpus_per_node: 8
