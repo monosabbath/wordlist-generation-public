@@ -10,4 +10,4 @@ if [ -f .env ]; then
 fi
 
 # Start FastAPI server (OpenAI-compatible)
-uv run uvicorn server:app --host 0.0.0.0 --port 8010
+uv run --active uvicorn server:app --host 0.0.0.0 --port 8010
