@@ -362,12 +362,10 @@ def apply_chat_template(messages: List[Dict[str, str]]) -> str:
 
 def build_runtime_sampling_config(
     max_new_tokens: int,
-    num_beams: int,
     length_penalty: float,
 ) -> RuntimeSamplingConfig:
     eos = get_eos_id()
     pad = get_pad_id()
-    # Enforce TRT-LLM requirement: request beam width == configured max_beam_width
     nb = MAX_BEAM_WIDTH
     # Beam search: enforce temperature 0.0; greedy (nb=1) uses temperature 1.0
     temperature = 0.0 if nb > 1 else 1.0
@@ -429,8 +427,6 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     vocab_lang: str
     vocab_n_words: int
-    # Default to MAX_BEAM_WIDTH; if provided and mismatched, we will coerce to MAX_BEAM_WIDTH.
-    num_beams: Optional[int] = None
     length_penalty: Optional[float] = 1.0
 
 @app.get("/v1/models")
@@ -467,17 +463,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         )
 
     max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 128
-
-    # Resolve num_beams; coerce to MAX_BEAM_WIDTH to satisfy TRT-LLM assertion
-    requested_beams = int(req.num_beams) if req.num_beams is not None else MAX_BEAM_WIDTH
-    if requested_beams != MAX_BEAM_WIDTH:
-        logger.warning(
-            f"Request num_beams={requested_beams} differs from MAX_BEAM_WIDTH={MAX_BEAM_WIDTH}. "
-            f"Coercing to {MAX_BEAM_WIDTH} to satisfy TRT-LLM."
-        )
     runtime_cfg = build_runtime_sampling_config(
         max_new_tokens=max_new_tokens,
-        num_beams=MAX_BEAM_WIDTH,
         length_penalty=float(req.length_penalty if req.length_penalty is not None else 1.0),
     )
 
@@ -545,12 +532,6 @@ def process_batch_job(
             raise ValueError("No valid requests in batch.")
 
         max_tokens = int(job_config.get("max_tokens", 128))
-        requested_num_beams = int(job_config.get("num_beams", MAX_BEAM_WIDTH))
-        if requested_num_beams != MAX_BEAM_WIDTH:
-            logger.warning(
-                f"[Job {job_id}] Requested num_beams={requested_num_beams} differs from MAX_BEAM_WIDTH={MAX_BEAM_WIDTH}. "
-                f"Coercing to {MAX_BEAM_WIDTH} to satisfy TRT-LLM."
-            )
         length_penalty = float(job_config.get("length_penalty", 1.0))
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
@@ -560,7 +541,7 @@ def process_batch_job(
         # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
         ensure_trt_runtime_ready()
 
-        runtime_cfg = build_runtime_sampling_config(max_tokens, MAX_BEAM_WIDTH, length_penalty)
+        runtime_cfg = build_runtime_sampling_config(max_tokens, length_penalty)
 
         logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
         logits_processor = build_logits_processor_for(vocab_lang, int(vocab_n_words))
@@ -616,8 +597,6 @@ def create_batch_job(
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
     max_tokens: int = 128,
-    # Default num_beams to MAX_BEAM_WIDTH to satisfy TRT-LLM assertion
-    num_beams: int = MAX_BEAM_WIDTH,
     length_penalty: float = 1.0,
     vocab_lang: Optional[str] = None,
     vocab_n_words: Optional[int] = None,
@@ -638,7 +617,6 @@ def create_batch_job(
 
     job_config = {
         "max_tokens": max_tokens,
-        "num_beams": num_beams,
         "length_penalty": length_penalty,
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
