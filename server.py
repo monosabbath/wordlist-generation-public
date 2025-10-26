@@ -10,6 +10,7 @@ from functools import cache
 from typing import Optional, Dict, Any, List
 
 import torch
+import yaml
 from fastapi import (
     Depends,
     FastAPI,
@@ -73,21 +74,59 @@ logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_
 # -----------------------
 logger.info(f"Loading TRT-LLM model '{MODEL_NAME}' ...")
 
-llm_kwargs = dict(
+llm_kwargs: Dict[str, Any] = dict(
     model=MODEL_NAME,
     enable_trtllm_sampler=True,
     max_beam_width=MAX_BEAM_WIDTH,
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
+    trust_remote_code=True,  # often needed for chat template
 )
+
+# Map parallel_config.yaml to supported LLM kwargs (TP/PP/CP/MoE/attention DP/etc.)
 if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
-    llm_kwargs["parallel_config"] = PARALLEL_CONFIG_PATH
     logger.info(f"Using parallel config: {PARALLEL_CONFIG_PATH}")
+    try:
+        with open(PARALLEL_CONFIG_PATH, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+
+        tp = cfg.get("tensor_parallel_size") or cfg.get("tp_size") or cfg.get("tp") or 1
+        pp = cfg.get("pipeline_parallel_size") or cfg.get("pp_size") or cfg.get("pp") or 1
+        cp = cfg.get("context_parallel_size") or cfg.get("cp_size") or cfg.get("cp") or 1
+        moe_tp = cfg.get("moe_tensor_parallel_size") or cfg.get("moe_tp")
+        moe_ep = cfg.get("moe_expert_parallel_size") or cfg.get("moe_ep")
+        gpn = cfg.get("gpus_per_node")
+        enable_attention_dp = bool(cfg.get("enable_attention_dp", False))
+
+        llm_kwargs.update(
+            tensor_parallel_size=int(tp),
+            pipeline_parallel_size=int(pp),
+            context_parallel_size=int(cp),
+            enable_attention_dp=enable_attention_dp,
+        )
+        if moe_tp is not None:
+            llm_kwargs["moe_tensor_parallel_size"] = int(moe_tp)
+        if moe_ep is not None:
+            llm_kwargs["moe_expert_parallel_size"] = int(moe_ep)
+        if gpn is not None:
+            llm_kwargs["gpus_per_node"] = int(gpn)
+
+        logger.info(
+            f"LLM parallel settings -> TP={llm_kwargs.get('tensor_parallel_size', 1)}, "
+            f"PP={llm_kwargs.get('pipeline_parallel_size', 1)}, "
+            f"CP={llm_kwargs.get('context_parallel_size', 1)}, "
+            f"MoE-TP={llm_kwargs.get('moe_tensor_parallel_size')}, "
+            f"MoE-EP={llm_kwargs.get('moe_expert_parallel_size')}, "
+            f"Attention-DP={llm_kwargs.get('enable_attention_dp', False)}, "
+            f"GPN={llm_kwargs.get('gpus_per_node')}"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to parse {PARALLEL_CONFIG_PATH}: {e}. Falling back to defaults.")
 else:
-    logger.info("No parallel_config provided. TRT-LLM will infer defaults; for MoE you should supply one.")
+    logger.info("No parallel_config provided. TRT-LLM will use defaults (single node).")
 
 llm = LLM(**llm_kwargs)
-trt_tokenizer = llm.runtime_context.tokenizer
+trt_tokenizer = llm.tokenizer
 
 # HF tokenizer only to render chat templates (no weights loaded)
 chat_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -219,7 +258,7 @@ if PREBUILD_PREFIX:
                 continue
             for n_words in PREBUILD_WORD_COUNTS:
                 try:
-                     _= build_regex_grammar(lang, n_words)
+                    _ = build_regex_grammar(lang, n_words)
                 except Exception as e:
                     logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
         logger.info("Prebuild done.")
@@ -293,39 +332,39 @@ def build_sampling_params(
         )
     return sp
 
+def _extract_text_from_generate_output(o: Any) -> str:
+    # Try common TRT-LLM output shapes
+    try:
+        # Most common: o.outputs is a list, each has .text
+        if hasattr(o, "outputs") and o.outputs:
+            cand = o.outputs[0]
+            if hasattr(cand, "text"):
+                return cand.text
+        # Sometimes direct .text exists
+        if hasattr(o, "text"):
+            return o.text
+        # Fallback: token_ids -> detokenize
+        if hasattr(o, "token_ids") and o.token_ids:
+            return trt_tokenizer.decode(o.token_ids)
+    except Exception:
+        pass
+    return ""
+
 def trt_generate_texts(
     prompts: List[str],
     sampling_params: SamplingParams,
     logits_processor=None,
 ) -> List[str]:
-    inputs_enc = trt_tokenizer.batch_encode_plus(prompts)
-    input_ids_list = inputs_enc["input_ids"]
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    max_len = max(len(x) for x in input_ids_list)
-    pad_id = get_pad_id()
-    batch = []
-    input_lens = []
-    for seq in input_ids_list:
-        input_lens.append(len(seq))
-        if len(seq) < max_len:
-            seq = seq + [pad_id] * (max_len - len(seq))
-        batch.append(seq)
-    inputs = torch.LongTensor(batch).to(device)
-
-    out = llm.runtime_context.runtime.generate(
-        inputs,
-        sampling_config=sampling_params,
+    # Use TRT-LLM high-level API
+    outs = llm.generate(
+        prompts,
+        sampling_params=sampling_params,
         logits_processor=logits_processor,
     )
-
-    outputs: List[str] = []
-    for i in range(len(prompts)):
-        seq = out["output_ids"][i][0].tolist()
-        gen_ids = seq[input_lens[i]:]
-        txt = trt_tokenizer.decode(gen_ids)
-        outputs.append(txt)
-    return outputs
+    texts: List[str] = []
+    for o in outs:
+        texts.append(_extract_text_from_generate_output(o))
+    return texts
 
 # -----------------------
 # OpenAI-compatible API
@@ -376,7 +415,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     start = time.time()
     outputs = trt_generate_texts([text_prompt], sampling_params, logits_processor=logits_processor)
-    text = outputs[0]
+    text = outputs[0] if outputs else ""
     elapsed = time.time() - start
     logger.info(f"Generated in {elapsed:.2f}s")
 
@@ -415,6 +454,7 @@ def process_batch_job(
     logger.info(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
+
         with open(input_path, "r", encoding="utf-8") as f:
             raw_requests = json.load(f)
             if not isinstance(raw_requests, list):
@@ -432,6 +472,7 @@ def process_batch_job(
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Error processing. {e}")
+
         if not prompts:
             raise ValueError("No valid requests in batch.")
 
@@ -474,8 +515,10 @@ def process_batch_job(
                 },
             }
             final_output.append(resp)
+
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(final_output, f, indent=2)
+
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
     except Exception as e:
@@ -505,6 +548,7 @@ def create_batch_job(
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
     os.makedirs(BATCH_JOB_TEMP_DIR, exist_ok=True)
+
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
