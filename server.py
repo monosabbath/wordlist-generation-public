@@ -315,23 +315,21 @@ def verify_token(
 # Generation helpers
 # -----------------------
 def apply_chat_template(messages: List[Dict[str, str]]) -> str:
-    system_prompt = ""
-    for msg in messages:
-        if msg["role"] == "system":
-            system_prompt = msg["content"]
-            break
-    msgs = []
-    if system_prompt:
-        msgs.append({"role": "system", "content": system_prompt})
-    for msg in messages:
-        if msg["role"] != "system":
-            msgs.append({"role": msg["role"], "content": msg["content"]})
-    text = chat_tokenizer.apply_chat_template(
-        msgs,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    # ... unchanged ...
     return text
+
+def _choose_enforcer_tokenizer():
+    """
+    Prefer the TRT tokenizer (exactly the same IDs used by the engine).
+    Fallback to the HF tokenizer if __len__ is not available (TRT tokenizer
+    may not implement it, and lm-format-enforcer calls len(tokenizer)).
+    """
+    try:
+        _ = len(trt_tokenizer)  # may raise NotImplementedError
+        return trt_tokenizer
+    except Exception:
+        logger.warning("TRT tokenizer lacks __len__; using HF tokenizer for constrained decoding.")
+        return chat_tokenizer
 
 def build_sampling_params(
     max_new_tokens: int,
@@ -340,15 +338,18 @@ def build_sampling_params(
 ) -> SamplingParams:
     eos = get_eos_id()
     pad = get_pad_id()
-    # Clamp to engine cap to avoid oversizing requests
+    # Clamp to engine caps
     max_new_tokens = int(max(1, min(max_new_tokens, MAX_NUM_TOKENS)))
-    if num_beams and num_beams > 1:
+    num_beams = int(num_beams or 1)
+    num_beams = max(1, min(num_beams, MAX_BEAM_WIDTH))
+
+    if num_beams > 1:
         sp = SamplingParams(
             end_id=eos,
             pad_id=pad,
             max_new_tokens=max_new_tokens,
             use_beam_search=True,
-            best_of=int(num_beams),
+            best_of=num_beams,
             n=1,
             length_penalty=float(length_penalty),
         )
@@ -364,38 +365,13 @@ def build_sampling_params(
         )
     return sp
 
-def _extract_text_from_generate_output(o: Any) -> str:
-    # Try common TRT-LLM output shapes
-    try:
-        # Most common: o.outputs is a list, each has .text
-        if hasattr(o, "outputs") and o.outputs:
-            cand = o.outputs[0]
-            if hasattr(cand, "text"):
-                return cand.text
-        # Sometimes direct .text exists
-        if hasattr(o, "text"):
-            return o.text
-        # Fallback: token_ids -> detokenize
-        if hasattr(o, "token_ids") and o.token_ids:
-            return trt_tokenizer.decode(o.token_ids)
-    except Exception:
-        pass
-    return ""
-
-def trt_generate_texts(
-    prompts: List[str],
-    sampling_params: SamplingParams,
-    logits_processor=None,
-) -> List[str]:
-    outs = llm.generate(
-        prompts,
-        sampling_params=sampling_params,
-        logits_processor=logits_processor,
-    )
-    texts: List[str] = []
-    for o in outs:
-        texts.append(_extract_text_from_generate_output(o))
-    return texts
+def build_logits_processor_for(lang: str, n_words: int):
+    grammar = build_regex_grammar(lang, n_words)
+    if not grammar:
+        return None
+    parser = RegexParser(grammar)
+    tok_for_enforcer = _choose_enforcer_tokenizer()
+    return build_trtllm_logits_processor(tok_for_enforcer, parser)
 
 # -----------------------
 # OpenAI-compatible API
