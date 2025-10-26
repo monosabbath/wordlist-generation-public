@@ -66,8 +66,9 @@ MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1"))
 MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))   # small prompt cap
 MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))      # prompt+output cap
 MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", "1024"))
-KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "fp16")     # auto|fp16|bf16 (fp8 on Hopper)
 
+# KV cache override: only pass when fp8; otherwise let TRT-LLM decide (auto)
+KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "auto").lower()
 PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
 
 # Batch jobs
@@ -82,7 +83,14 @@ logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_
 # -----------------------
 logger.info(f"Loading TRT-LLM model '{MODEL_NAME}' ...")
 
-kv_cfg = KvCacheConfig(dtype=KV_CACHE_DTYPE) if KV_CACHE_DTYPE else None
+kv_cfg = None
+if KV_CACHE_DTYPE == "fp8":
+    kv_cfg = KvCacheConfig(dtype="fp8")
+elif KV_CACHE_DTYPE not in ("auto", ""):
+    logger.warning(
+        f"KV_CACHE_DTYPE={KV_CACHE_DTYPE} is not supported by TRT-LLM PyTorch backend; "
+        f"accepted overrides: 'fp8' or 'auto'. Using 'auto'."
+    )
 
 llm_kwargs: Dict[str, Any] = dict(
     model=MODEL_NAME,
@@ -97,8 +105,10 @@ llm_kwargs: Dict[str, Any] = dict(
     max_input_len=MAX_INPUT_LEN,
     max_seq_len=MAX_SEQ_LEN,
     max_num_tokens=MAX_NUM_TOKENS,
-    kv_cache_config=kv_cfg,
 )
+
+if kv_cfg is not None:
+    llm_kwargs["kv_cache_config"] = kv_cfg
 
 # Map parallel_config.yaml to supported LLM kwargs (TP/PP/CP/MoE/attention DP/etc.)
 if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
@@ -144,7 +154,7 @@ trt_tokenizer = llm.tokenizer
 
 # Log the effective caps
 logger.info(
-    "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv=%s",
+    "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
 )
 
@@ -330,11 +340,13 @@ def build_sampling_params(
 ) -> SamplingParams:
     eos = get_eos_id()
     pad = get_pad_id()
+    # Clamp to engine cap to avoid oversizing requests
+    max_new_tokens = int(max(1, min(max_new_tokens, MAX_NUM_TOKENS)))
     if num_beams and num_beams > 1:
         sp = SamplingParams(
             end_id=eos,
             pad_id=pad,
-            max_new_tokens=int(max_new_tokens),
+            max_new_tokens=max_new_tokens,
             use_beam_search=True,
             best_of=int(num_beams),
             n=1,
@@ -344,7 +356,7 @@ def build_sampling_params(
         sp = SamplingParams(
             end_id=eos,
             pad_id=pad,
-            max_new_tokens=int(max_new_tokens),
+            max_new_tokens=max_new_tokens,
             temperature=1.0,
             top_k=1,
             top_p=0.0,
