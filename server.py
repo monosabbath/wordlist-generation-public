@@ -6,6 +6,7 @@ import tempfile
 import unicodedata
 import re
 import logging
+from functools import cache
 from typing import Optional, Dict, Any, List
 
 import torch  # noqa: F401
@@ -24,18 +25,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
-# functools.cache is 3.9+, fall back to lru_cache in older envs
-try:
-    from functools import cache
-except ImportError:
-    from functools import lru_cache as cache
-
 # Load env
 load_dotenv()
 
 # TensorRT-LLM
-from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm import LLM
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.runtime import SamplingConfig as RuntimeSamplingConfig
 
 # lm-format-enforcer integration for TensorRT-LLM
 from lmformatenforcer import RegexParser
@@ -43,7 +39,6 @@ from lmformatenforcer.integrations.trtllm import build_trtllm_logits_processor
 
 # For chat templates only; we do NOT use transformers for inference
 from transformers import AutoTokenizer
-
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -96,7 +91,7 @@ elif KV_CACHE_DTYPE not in ("auto", ""):
 
 llm_kwargs: Dict[str, Any] = dict(
     model=MODEL_NAME,
-    enable_trtllm_sampler=True,
+    enable_trtllm_sampler=True,  # harmless here; we use runtime API for generation
     max_beam_width=MAX_BEAM_WIDTH,
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
@@ -151,7 +146,7 @@ else:
     logger.info("No parallel_config provided. TRT-LLM will use defaults (single node).")
 
 llm = LLM(**llm_kwargs)
-trt_tokenizer = llm.tokenizer
+
 logger.info(
     "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -165,9 +160,13 @@ if chat_tokenizer.pad_token_id is None and chat_tokenizer.eos_token_id is not No
 # -----------------------
 # Helpers for stop tokens
 # -----------------------
+def _runtime_tokenizer():
+    return llm.runtime_context.tokenizer
+
 @cache
 def get_eos_id() -> int:
-    eos_id = getattr(trt_tokenizer, "eos_token_id", None)
+    rt = _runtime_tokenizer()
+    eos_id = getattr(rt, "eos_token_id", None)
     if eos_id is None:
         eos_id = chat_tokenizer.eos_token_id
     if eos_id is None:
@@ -176,7 +175,8 @@ def get_eos_id() -> int:
 
 @cache
 def get_pad_id() -> int:
-    pad_id = getattr(trt_tokenizer, "pad_token_id", None)
+    rt = _runtime_tokenizer()
+    pad_id = getattr(rt, "pad_token_id", None)
     if pad_id is None:
         pad_id = chat_tokenizer.pad_token_id
     if pad_id is None:
@@ -186,7 +186,7 @@ def get_pad_id() -> int:
 # -----------------------
 # Regex-constrained vocab (lowercase-only, trie-based)
 # -----------------------
-def normalizeword(w: str) -> str:
+def normalize_word(w: str) -> str:
     return unicodedata.normalize("NFC", w.strip()).lower()
 
 class _TrieNode:
@@ -196,7 +196,7 @@ class _TrieNode:
         self.end: bool = False
         self.min_rank: int = 10**12
 
-def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
+def build_trie_with_ranks(words: List[str]) -> _TrieNode:
     root = _TrieNode()
     for rank, w in enumerate(words, start=1):
         node = root
@@ -209,16 +209,16 @@ def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
         node.end = True
     return root
 
-def escapefor_regex(ch: str) -> str:
+def escape_for_regex(ch: str) -> str:
     return re.escape(ch)
 
-def trieto_regex(node: _TrieNode, nlimit: int) -> str:
+def trie_to_regex(node: _TrieNode, nlimit: int) -> str:
     alts = []
     for ch, child in sorted(node.children.items()):
         if child.min_rank > nlimit:
             continue
-        sub = trieto_regex(child, nlimit)
-        alts.append(escapefor_regex(ch) + sub)
+        sub = trie_to_regex(child, nlimit)
+        alts.append(escape_for_regex(ch) + sub)
     if node.end and node.min_rank <= nlimit:
         alts.append("")
     if not alts:
@@ -227,68 +227,56 @@ def trieto_regex(node: _TrieNode, nlimit: int) -> str:
         return alts[0]
     return "(?:" + "|".join(alts) + ")"
 
-TRIECACHE: Dict[str, Dict[str, Any]] = {}
+TRIE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 def safe_lang_name(lang: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9-]+", lang))
 
-def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
+def get_or_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     if not safe_lang_name(lang):
         logger.warning(f"Unsafe or invalid language identifier: {lang}")
         return None
-    if lang in TRIECACHE:
-        return TRIECACHE[lang]
+    if lang in TRIE_CACHE:
+        return TRIE_CACHE[lang]
     filename = f"{lang}.txt"
     if not os.path.exists(filename):
         return None
     try:
         with open(filename, encoding="utf-8") as fin:
-            words = [normalizeword(w) for w in fin if w.strip()]
+            words = [normalize_word(w) for w in fin if w.strip()]
     except Exception as e:
         logger.error(f"Error reading language file {filename}: {e}")
         return None
     if not words:
         return None
-    trie = buildtrie_with_ranks(words)
-    TRIECACHE[lang] = {"trie": trie}
-    return TRIECACHE[lang]
+    trie = build_trie_with_ranks(words)
+    TRIE_CACHE[lang] = {"trie": trie}
+    return TRIE_CACHE[lang]
 
-def buildword_regex_for_n(lang: str, n_words: int) -> Optional[str]:
-    data = getor_build_trie(lang)
+def build_word_regex_for_n(lang: str, n_words: int) -> Optional[str]:
+    data = get_or_build_trie(lang)
     if data is None:
         return None
     trie: _TrieNode = data["trie"]
     if trie.min_rank > n_words:
         return None
-    return trieto_regex(trie, nlimit=n_words)
+    return trie_to_regex(trie, nlimit=n_words)
 
 @cache
 def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
-    word_regex = buildword_regex_for_n(lang, n_words)
+    word_regex = build_word_regex_for_n(lang, n_words)
     if not word_regex:
         return None
     punct_regex = r'[.,!?¿¡…\s]+'
     return fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
-def choose_enforcer_tokenizer():
-    """
-    Prefer TRT tokenizer; fallback to HF tokenizer if len(...) is missing,
-    because lm-format-enforcer calls len(tokenizer).
-    """
-    try:
-        _ = len(trt_tokenizer)  # may raise NotImplementedError
-        return trt_tokenizer
-    except Exception:
-        logger.warning("TRT tokenizer lacks len(); using HF tokenizer for constrained decoding.")
-        return chat_tokenizer
 
 def build_logits_processor_for(lang: str, n_words: int):
     grammar = build_regex_grammar(lang, n_words)
     if not grammar:
         return None
     parser = RegexParser(grammar)
-    tok_for_enforcer = choose_enforcer_tokenizer()
-    return build_trtllm_logits_processor(tok_for_enforcer, parser)
+    rt_tok = _runtime_tokenizer()
+    return build_trtllm_logits_processor(rt_tok, parser)
 
 # Startup prebuilds (optional)
 if PREBUILD_PREFIX:
@@ -324,7 +312,7 @@ def verify_token(
     return True
 
 # -----------------------
-# Generation helpers
+# Generation helpers (runtime API only, constrained decoding)
 # -----------------------
 def apply_chat_template(messages: List[Dict[str, str]]) -> str:
     system_prompt = ""
@@ -345,87 +333,60 @@ def apply_chat_template(messages: List[Dict[str, str]]) -> str:
     )
     return text
 
-def build_sampling_params(
+def build_runtime_sampling_config(
     max_new_tokens: int,
     num_beams: int,
     length_penalty: float,
-) -> SamplingParams:
+) -> RuntimeSamplingConfig:
     eos = get_eos_id()
     pad = get_pad_id()
-
-    # Clamp to engine caps
-    max_tokens = int(max(1, min(max_new_tokens or 1, MAX_NUM_TOKENS)))
-    nb_req = int(num_beams or 1)
-    if nb_req > MAX_BEAM_WIDTH:
-        logger.warning(
-            "Requested num_beams=%s exceeds engine max_beam_width=%s; clamping.",
-            nb_req, MAX_BEAM_WIDTH
-        )
-    nb = max(1, min(nb_req, MAX_BEAM_WIDTH))
-
-    kwargs = dict(
+    nb = max(1, int(num_beams or 1))
+    # Beam search: enforce temperature 0.0; greedy (nb=1) uses temperature 1.0
+    temperature = 0.0 if nb > 1 else 1.0
+    top_k = 1
+    top_p = 0.0
+    return RuntimeSamplingConfig(
         end_id=eos,
         pad_id=pad,
-        max_tokens=max_tokens,  # TRT-LLM 1.0 uses max_tokens
+        max_new_tokens=int(max_new_tokens),
+        num_beams=nb,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
         length_penalty=float(length_penalty),
-        n=1,
+        early_stopping=1,
+        use_beam_hyps=True,
     )
 
-    if nb > 1:
-        # Beam search
-        kwargs.update(
-            use_beam_search=True,
-            best_of=nb,  # depending on TRT-LLM version, you may also set beam_width=nb
-            temperature=0.0,  # ignored for beam search
-        )
-    else:
-        # Greedy
-        kwargs.update(
-            temperature=1.0,
-            top_k=1,
-            top_p=0.0,
-        )
-
-    return SamplingParams(**kwargs)
-
-def _extract_text_from_generate_output(o: Any) -> str:
-    # Try common TRT-LLM output shapes
-    try:
-        # Most common: o.outputs is a list, each has .text
-        if hasattr(o, "outputs") and o.outputs:
-            cand = o.outputs[0]
-            if hasattr(cand, "text"):
-                return cand.text
-
-        # Sometimes direct .text exists
-        if hasattr(o, "text"):
-            return o.text
-
-        # Fallback: token_ids -> detokenize
-        if hasattr(o, "token_ids") and o.token_ids:
-            return trt_tokenizer.decode(o.token_ids)
-    except Exception:
-        pass
-    return ""
-
-def trt_generate_texts(
+def trt_runtime_generate_texts(
     prompts: List[str],
-    sampling_params: SamplingParams,
-    logits_processor=None,
+    runtime_sampling_config: RuntimeSamplingConfig,
+    logits_processor,
 ) -> List[str]:
-    # IMPORTANT: Pass logits_processor to generate(), do NOT attach it to SamplingParams
-    outs = llm.generate(
-        prompts,
-        sampling_params=sampling_params,
+    # Use the tokenizer that the TRT runtime uses
+    tokenizer = _runtime_tokenizer()
+    # Encode batch
+    batch_enc = tokenizer.batch_encode_plus(prompts)["input_ids"]
+    inputs = torch.LongTensor(batch_enc)
+
+    # Call the low-level runtime API with logits_processor
+    out = llm.runtime_context.runtime.generate(
+        inputs,
+        sampling_config=runtime_sampling_config,
         logits_processor=logits_processor,
     )
+
+    # Decode only the newly generated tokens per item (beam 0)
     texts: List[str] = []
-    for o in outs:
-        texts.append(_extract_text_from_generate_output(o))
+    output_ids = out["output_ids"]
+    for i, inp_ids in enumerate(batch_enc):
+        seq_ids = output_ids[i][0].tolist()
+        new_ids = seq_ids[len(inp_ids):]
+        texts.append(tokenizer.decode(new_ids))
     return texts
 
 # -----------------------
-# OpenAI-compatible API
+# OpenAI-compatible API (constrained only)
 # -----------------------
 class ChatMessage(BaseModel):
     role: str
@@ -435,8 +396,8 @@ class ChatCompletionRequest(BaseModel):
     model: str
     messages: list[ChatMessage]
     max_tokens: Optional[int] = None
-    vocab_lang: Optional[str] = None
-    vocab_n_words: Optional[int] = None
+    vocab_lang: str
+    vocab_n_words: int
     num_beams: Optional[int] = 1
     length_penalty: Optional[float] = 1.0
 
@@ -455,30 +416,33 @@ def list_models(auth_ok: bool = Depends(verify_token)):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
+    # Require constrained config
+    if not req.vocab_lang or not req.vocab_n_words:
+        raise HTTPException(status_code=400, detail="vocab_lang and vocab_n_words are required for constrained decoding.")
+
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     text_prompt = apply_chat_template(messages)
 
-    logits_processor = None
-    if req.vocab_lang and req.vocab_n_words:
-        logits_processor = build_logits_processor_for(req.vocab_lang, int(req.vocab_n_words))
-        if logits_processor is None:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.",
-            )
+    # Build logits processor from LMFE
+    logits_processor = build_logits_processor_for(req.vocab_lang, int(req.vocab_n_words))
+    if logits_processor is None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.",
+        )
 
     max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 128
-    sampling_params = build_sampling_params(
+    runtime_cfg = build_runtime_sampling_config(
         max_new_tokens=max_new_tokens,
         num_beams=int(req.num_beams or 1),
         length_penalty=float(req.length_penalty if req.length_penalty is not None else 1.0),
     )
 
     start = time.time()
-    outputs = trt_generate_texts([text_prompt], sampling_params, logits_processor=logits_processor)
+    outputs = trt_runtime_generate_texts([text_prompt], runtime_cfg, logits_processor=logits_processor)
     text = outputs[0] if outputs else ""
     elapsed = time.time() - start
-    logger.info(f"Generated in {elapsed:.2f}s")
+    logger.info(f"Generated (runtime+LMFE) in {elapsed:.2f}s")
 
     created = int(time.time())
     resp = {
@@ -502,7 +466,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     return resp
 
 # ---------------------------------------------------
-# BATCH JOB API
+# BATCH JOB API (constrained only)
 # ---------------------------------------------------
 JOB_STATUS: Dict[str, Dict[str, Any]] = {}
 
@@ -539,19 +503,20 @@ def process_batch_job(
         max_tokens = int(job_config.get("max_tokens", 128))
         num_beams = int(job_config.get("num_beams", 1))
         length_penalty = float(job_config.get("length_penalty", 1.0))
-        sampling_params = build_sampling_params(max_tokens, num_beams, length_penalty)
-
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
-        logits_processor = None
-        if vocab_lang and vocab_n_words:
-            logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
-            logits_processor = build_logits_processor_for(vocab_lang, int(vocab_n_words))
-            if logits_processor is None:
-                raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-        logger.info(f"[Job {job_id}] Generating {len(prompts)} responses with TRT-LLM...")
-        results = trt_generate_texts(prompts, sampling_params, logits_processor=logits_processor)
+        if not vocab_lang or not vocab_n_words:
+            raise ValueError("vocab_lang and vocab_n_words are required for constrained decoding batch jobs.")
+
+        runtime_cfg = build_runtime_sampling_config(max_tokens, num_beams, length_penalty)
+        logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
+        logits_processor = build_logits_processor_for(vocab_lang, int(vocab_n_words))
+        if logits_processor is None:
+            raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
+
+        logger.info(f"[Job {job_id}] Generating {len(prompts)} responses with TRT-LLM runtime + LMFE ...")
+        results = trt_runtime_generate_texts(prompts, runtime_cfg, logits_processor=logits_processor)
 
         created = int(time.time())
         final_output = []
@@ -604,6 +569,9 @@ def create_batch_job(
     vocab_lang: Optional[str] = None,
     vocab_n_words: Optional[int] = None,
 ):
+    if not vocab_lang or not vocab_n_words:
+        raise HTTPException(status_code=400, detail="vocab_lang and vocab_n_words are required for constrained decoding batch jobs.")
+
     job_id = str(uuid.uuid4())
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
