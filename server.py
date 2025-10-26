@@ -6,7 +6,6 @@ import tempfile
 import unicodedata
 import re
 import logging
-from functools import cache
 from typing import Optional, Dict, Any, List
 
 import torch  # noqa: F401
@@ -25,6 +24,12 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
+# functools.cache is 3.9+, fall back to lru_cache in older envs
+try:
+    from functools import cache
+except ImportError:
+    from functools import lru_cache as cache
+
 # Load env
 load_dotenv()
 
@@ -38,6 +43,7 @@ from lmformatenforcer.integrations.trtllm import build_trtllm_logits_processor
 
 # For chat templates only; we do NOT use transformers for inference
 from transformers import AutoTokenizer
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -223,11 +229,11 @@ def trieto_regex(node: _TrieNode, nlimit: int) -> str:
 
 TRIECACHE: Dict[str, Dict[str, Any]] = {}
 
-def _safe_lang_name(lang: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", lang))
+def safe_lang_name(lang: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9-]+", lang))
 
 def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
-    if not _safe_lang_name(lang):
+    if not safe_lang_name(lang):
         logger.warning(f"Unsafe or invalid language identifier: {lang}")
         return None
     if lang in TRIECACHE:
@@ -264,7 +270,7 @@ def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
     punct_regex = r'[.,!?¿¡…\s]+'
     return fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
-def _choose_enforcer_tokenizer():
+def choose_enforcer_tokenizer():
     """
     Prefer TRT tokenizer; fallback to HF tokenizer if len(...) is missing,
     because lm-format-enforcer calls len(tokenizer).
@@ -281,7 +287,7 @@ def build_logits_processor_for(lang: str, n_words: int):
     if not grammar:
         return None
     parser = RegexParser(grammar)
-    tok_for_enforcer = _choose_enforcer_tokenizer()
+    tok_for_enforcer = choose_enforcer_tokenizer()
     return build_trtllm_logits_processor(tok_for_enforcer, parser)
 
 # Startup prebuilds (optional)
@@ -289,7 +295,7 @@ if PREBUILD_PREFIX:
     if PREBUILD_LANGS:
         logger.info("Prebuilding regex grammars...")
         for lang in PREBUILD_LANGS:
-            if not _safe_lang_name(lang):
+            if not safe_lang_name(lang):
                 logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
                 continue
             for n_words in PREBUILD_WORD_COUNTS:
@@ -351,24 +357,26 @@ def build_sampling_params(
     max_tokens = int(max(1, min(max_new_tokens or 1, MAX_NUM_TOKENS)))
     nb_req = int(num_beams or 1)
     if nb_req > MAX_BEAM_WIDTH:
-        logger.warning("Requested num_beams=%s exceeds engine max_beam_width=%s; clamping.",
-                       nb_req, MAX_BEAM_WIDTH)
+        logger.warning(
+            "Requested num_beams=%s exceeds engine max_beam_width=%s; clamping.",
+            nb_req, MAX_BEAM_WIDTH
+        )
     nb = max(1, min(nb_req, MAX_BEAM_WIDTH))
 
     kwargs = dict(
         end_id=eos,
         pad_id=pad,
-        max_tokens=max_tokens,           # TRT-LLM 1.0 uses max_tokens
+        max_tokens=max_tokens,  # TRT-LLM 1.0 uses max_tokens
         length_penalty=float(length_penalty),
+        n=1,
     )
 
     if nb > 1:
-        # Beam search: best_of == requested beams (clamped)
+        # Beam search
         kwargs.update(
             use_beam_search=True,
-            best_of=nb,
-            n=1,                         # return 1 sequence
-            temperature=0.0,             # typical for beams; ignored by beam search
+            best_of=nb,  # depending on TRT-LLM version, you may also set beam_width=nb
+            temperature=0.0,  # ignored for beam search
         )
     else:
         # Greedy
@@ -388,9 +396,11 @@ def _extract_text_from_generate_output(o: Any) -> str:
             cand = o.outputs[0]
             if hasattr(cand, "text"):
                 return cand.text
+
         # Sometimes direct .text exists
         if hasattr(o, "text"):
             return o.text
+
         # Fallback: token_ids -> detokenize
         if hasattr(o, "token_ids") and o.token_ids:
             return trt_tokenizer.decode(o.token_ids)
@@ -403,13 +413,11 @@ def trt_generate_texts(
     sampling_params: SamplingParams,
     logits_processor=None,
 ) -> List[str]:
-    # In TRT-LLM 1.0, logits processors are set on SamplingParams
-    if logits_processor is not None:
-        sampling_params.logits_processor = logits_processor
-
+    # IMPORTANT: Pass logits_processor to generate(), do NOT attach it to SamplingParams
     outs = llm.generate(
         prompts,
         sampling_params=sampling_params,
+        logits_processor=logits_processor,
     )
     texts: List[str] = []
     for o in outs:
@@ -452,7 +460,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     logits_processor = None
     if req.vocab_lang and req.vocab_n_words:
-        logits_processor = build_logits_processor_for(req.vocab_lang, req.vocab_n_words)
+        logits_processor = build_logits_processor_for(req.vocab_lang, int(req.vocab_n_words))
         if logits_processor is None:
             raise HTTPException(
                 status_code=500,
@@ -509,8 +517,8 @@ def process_batch_job(
         JOB_STATUS[job_id]["status"] = "processing"
         with open(input_path, "r", encoding="utf-8") as f:
             raw_requests = json.load(f)
-            if not isinstance(raw_requests, list):
-                raise ValueError("Input file must contain a JSON list.")
+        if not isinstance(raw_requests, list):
+            raise ValueError("Input file must contain a JSON list.")
 
         logger.info(f"[Job {job_id}] Preparing {len(raw_requests)} prompts...")
         prompts: List[str] = []
@@ -581,7 +589,7 @@ def process_batch_job(
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)
-                logger.info(f"[Job {job_id}] Cleaned up input file.")
+            logger.info(f"[Job {job_id}] Cleaned up input file.")
         except Exception as e:
             logger.warning(f"[Job {job_id}] Failed to clean up input file: {e}")
 
