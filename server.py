@@ -9,7 +9,7 @@ import logging
 from functools import cache
 from typing import Optional, Dict, Any, List
 
-import torch
+import torch  # noqa: F401
 import yaml
 from fastapi import (
     Depends,
@@ -44,7 +44,6 @@ from transformers import AutoTokenizer
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("vocab-constrained-trtllm")
-
 app = FastAPI()
 
 # -----------------------
@@ -60,14 +59,12 @@ PREBUILD_WORD_COUNTS = tuple(
 )
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
-# TRT-LLM memory caps (keep small to avoid OOM)
+# TRT-LLM memory caps (keep modest to avoid OOM; adjust via env as needed)
 MAX_BEAM_WIDTH = int(os.getenv("MAX_BEAM_WIDTH", "10"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1"))
 MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))
 MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))
 MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", str(MAX_SEQ_LEN)))
-
-# KV cache override: only pass when fp8; otherwise let TRT-LLM pick (auto)
 KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "auto").lower()
 
 PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
@@ -75,7 +72,6 @@ PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
 # Batch jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
-
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_PIPELINE_SIZE}")
 
@@ -89,7 +85,7 @@ if KV_CACHE_DTYPE == "fp8":
     kv_cfg = KvCacheConfig(dtype="fp8")
 elif KV_CACHE_DTYPE not in ("auto", ""):
     logger.warning(
-        f"KV_CACHE_DTYPE={KV_CACHE_DTYPE} is not supported override; accepted: 'fp8' or 'auto'. Using 'auto'."
+        f"KV_CACHE_DTYPE={KV_CACHE_DTYPE} is not a supported override; accepted: 'fp8' or 'auto'. Using 'auto'."
     )
 
 llm_kwargs: Dict[str, Any] = dict(
@@ -99,7 +95,7 @@ llm_kwargs: Dict[str, Any] = dict(
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
     trust_remote_code=True,
-    # Memory limiting
+    # Memory limiting (critical to avoid OOM)
     max_batch_size=MAX_BATCH_SIZE,
     max_input_len=MAX_INPUT_LEN,
     max_seq_len=MAX_SEQ_LEN,
@@ -150,7 +146,6 @@ else:
 
 llm = LLM(**llm_kwargs)
 trt_tokenizer = llm.tokenizer
-
 logger.info(
     "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -271,14 +266,14 @@ def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
 
 def _choose_enforcer_tokenizer():
     """
-    Prefer TRT tokenizer; fallback to HF tokenizer if __len__ is missing,
+    Prefer TRT tokenizer; fallback to HF tokenizer if len(...) is missing,
     because lm-format-enforcer calls len(tokenizer).
     """
     try:
         _ = len(trt_tokenizer)  # may raise NotImplementedError
         return trt_tokenizer
     except Exception:
-        logger.warning("TRT tokenizer lacks __len__; using HF tokenizer for constrained decoding.")
+        logger.warning("TRT tokenizer lacks len(); using HF tokenizer for constrained decoding.")
         return chat_tokenizer
 
 def build_logits_processor_for(lang: str, n_words: int):
@@ -354,31 +349,29 @@ def build_sampling_params(
 
     # Clamp to engine caps
     max_tokens = int(max(1, min(max_new_tokens or 1, MAX_NUM_TOKENS)))
-    nb = int(num_beams or 1)
+    nb_req = int(num_beams or 1)
+    if nb_req > MAX_BEAM_WIDTH:
+        logger.warning("Requested num_beams=%s exceeds engine max_beam_width=%s; clamping.",
+                       nb_req, MAX_BEAM_WIDTH)
+    nb = max(1, min(nb_req, MAX_BEAM_WIDTH))
 
-    # Base kwargs
     kwargs = dict(
         end_id=eos,
         pad_id=pad,
-        max_tokens=max_tokens,            # TRT-LLM 1.0 uses max_tokens
+        max_tokens=max_tokens,           # TRT-LLM 1.0 uses max_tokens
         length_penalty=float(length_penalty),
     )
 
     if nb > 1:
-        # TRT-LLM 1.0 docs: best_of must equal LLM.max_beam_width
-        if nb != MAX_BEAM_WIDTH:
-            logger.warning(
-                "num_beams (%s) != MAX_BEAM_WIDTH (%s); enforcing best_of=%s as required by TRT-LLM 1.0.",
-                nb, MAX_BEAM_WIDTH, MAX_BEAM_WIDTH
-            )
+        # Beam search: best_of == requested beams (clamped)
         kwargs.update(
             use_beam_search=True,
-            best_of=MAX_BEAM_WIDTH,       # must equal LLM.max_beam_width
-            n=1,                          # we return a single sequence
-            temperature=0.0,              # typical for deterministic beams
+            best_of=nb,
+            n=1,                         # return 1 sequence
+            temperature=0.0,             # typical for beams; ignored by beam search
         )
     else:
-        # Greedy/sampling
+        # Greedy
         kwargs.update(
             temperature=1.0,
             top_k=1,
@@ -410,10 +403,13 @@ def trt_generate_texts(
     sampling_params: SamplingParams,
     logits_processor=None,
 ) -> List[str]:
+    # In TRT-LLM 1.0, logits processors are set on SamplingParams
+    if logits_processor is not None:
+        sampling_params.logits_processor = logits_processor
+
     outs = llm.generate(
         prompts,
         sampling_params=sampling_params,
-        logits_processor=logits_processor,
     )
     texts: List[str] = []
     for o in outs:
@@ -433,7 +429,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     vocab_lang: Optional[str] = None
     vocab_n_words: Optional[int] = None
-    num_beams: Optional[int] = 10
+    num_beams: Optional[int] = 1
     length_penalty: Optional[float] = 1.0
 
 @app.get("/v1/models")
@@ -458,12 +454,15 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     if req.vocab_lang and req.vocab_n_words:
         logits_processor = build_logits_processor_for(req.vocab_lang, req.vocab_n_words)
         if logits_processor is None:
-            raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.",
+            )
 
     max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 128
     sampling_params = build_sampling_params(
         max_new_tokens=max_new_tokens,
-        num_beams=int(req.num_beams or 10),
+        num_beams=int(req.num_beams or 1),
         length_penalty=float(req.length_penalty if req.length_penalty is not None else 1.0),
     )
 
@@ -530,7 +529,7 @@ def process_batch_job(
             raise ValueError("No valid requests in batch.")
 
         max_tokens = int(job_config.get("max_tokens", 128))
-        num_beams = int(job_config.get("num_beams", 10))
+        num_beams = int(job_config.get("num_beams", 1))
         length_penalty = float(job_config.get("length_penalty", 1.0))
         sampling_params = build_sampling_params(max_tokens, num_beams, length_penalty)
 
@@ -592,7 +591,7 @@ def create_batch_job(
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
     max_tokens: int = 128,
-    num_beams: int = 10,
+    num_beams: int = 1,
     length_penalty: float = 1.0,
     vocab_lang: Optional[str] = None,
     vocab_n_words: Optional[int] = None,
@@ -601,6 +600,7 @@ def create_batch_job(
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
     os.makedirs(BATCH_JOB_TEMP_DIR, exist_ok=True)
+
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
