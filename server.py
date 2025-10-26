@@ -60,15 +60,16 @@ PREBUILD_WORD_COUNTS = tuple(
 )
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
-# TRT-LLM memory caps (use only supported args)
-MAX_BEAM_WIDTH = int(os.getenv("MAX_BEAM_WIDTH", "10"))  # allow up to 10 beams
+# TRT-LLM memory caps (keep small to avoid OOM)
+MAX_BEAM_WIDTH = int(os.getenv("MAX_BEAM_WIDTH", "10"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1"))
-MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))   # small prompt cap
-MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))      # prompt+output cap
-MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", "1024"))
+MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))
+MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))
+MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", str(MAX_SEQ_LEN)))
 
-# KV cache override: only pass when fp8; otherwise let TRT-LLM decide (auto)
+# KV cache override: only pass when fp8; otherwise let TRT-LLM pick (auto)
 KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "auto").lower()
+
 PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
 
 # Batch jobs
@@ -88,8 +89,7 @@ if KV_CACHE_DTYPE == "fp8":
     kv_cfg = KvCacheConfig(dtype="fp8")
 elif KV_CACHE_DTYPE not in ("auto", ""):
     logger.warning(
-        f"KV_CACHE_DTYPE={KV_CACHE_DTYPE} is not supported by TRT-LLM PyTorch backend; "
-        f"accepted overrides: 'fp8' or 'auto'. Using 'auto'."
+        f"KV_CACHE_DTYPE={KV_CACHE_DTYPE} is not supported override; accepted: 'fp8' or 'auto'. Using 'auto'."
     )
 
 llm_kwargs: Dict[str, Any] = dict(
@@ -99,8 +99,7 @@ llm_kwargs: Dict[str, Any] = dict(
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
     trust_remote_code=True,
-
-    # Memory limiting (supported)
+    # Memory limiting
     max_batch_size=MAX_BATCH_SIZE,
     max_input_len=MAX_INPUT_LEN,
     max_seq_len=MAX_SEQ_LEN,
@@ -152,7 +151,6 @@ else:
 llm = LLM(**llm_kwargs)
 trt_tokenizer = llm.tokenizer
 
-# Log the effective caps
 logger.info(
     "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -271,12 +269,25 @@ def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
     punct_regex = r'[.,!?¿¡…\s]+'
     return fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
+def _choose_enforcer_tokenizer():
+    """
+    Prefer TRT tokenizer; fallback to HF tokenizer if __len__ is missing,
+    because lm-format-enforcer calls len(tokenizer).
+    """
+    try:
+        _ = len(trt_tokenizer)  # may raise NotImplementedError
+        return trt_tokenizer
+    except Exception:
+        logger.warning("TRT tokenizer lacks __len__; using HF tokenizer for constrained decoding.")
+        return chat_tokenizer
+
 def build_logits_processor_for(lang: str, n_words: int):
     grammar = build_regex_grammar(lang, n_words)
     if not grammar:
         return None
     parser = RegexParser(grammar)
-    return build_trtllm_logits_processor(trt_tokenizer, parser)
+    tok_for_enforcer = _choose_enforcer_tokenizer()
+    return build_trtllm_logits_processor(tok_for_enforcer, parser)
 
 # Startup prebuilds (optional)
 if PREBUILD_PREFIX:
@@ -315,21 +326,23 @@ def verify_token(
 # Generation helpers
 # -----------------------
 def apply_chat_template(messages: List[Dict[str, str]]) -> str:
-    # ... unchanged ...
+    system_prompt = ""
+    for msg in messages:
+        if msg["role"] == "system":
+            system_prompt = msg["content"]
+            break
+    msgs = []
+    if system_prompt:
+        msgs.append({"role": "system", "content": system_prompt})
+    for msg in messages:
+        if msg["role"] != "system":
+            msgs.append({"role": msg["role"], "content": msg["content"]})
+    text = chat_tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
     return text
-
-def _choose_enforcer_tokenizer():
-    """
-    Prefer the TRT tokenizer (exactly the same IDs used by the engine).
-    Fallback to the HF tokenizer if __len__ is not available (TRT tokenizer
-    may not implement it, and lm-format-enforcer calls len(tokenizer)).
-    """
-    try:
-        _ = len(trt_tokenizer)  # may raise NotImplementedError
-        return trt_tokenizer
-    except Exception:
-        logger.warning("TRT tokenizer lacks __len__; using HF tokenizer for constrained decoding.")
-        return chat_tokenizer
 
 def build_sampling_params(
     max_new_tokens: int,
@@ -365,13 +378,38 @@ def build_sampling_params(
         )
     return sp
 
-def build_logits_processor_for(lang: str, n_words: int):
-    grammar = build_regex_grammar(lang, n_words)
-    if not grammar:
-        return None
-    parser = RegexParser(grammar)
-    tok_for_enforcer = _choose_enforcer_tokenizer()
-    return build_trtllm_logits_processor(tok_for_enforcer, parser)
+def _extract_text_from_generate_output(o: Any) -> str:
+    # Try common TRT-LLM output shapes
+    try:
+        # Most common: o.outputs is a list, each has .text
+        if hasattr(o, "outputs") and o.outputs:
+            cand = o.outputs[0]
+            if hasattr(cand, "text"):
+                return cand.text
+        # Sometimes direct .text exists
+        if hasattr(o, "text"):
+            return o.text
+        # Fallback: token_ids -> detokenize
+        if hasattr(o, "token_ids") and o.token_ids:
+            return trt_tokenizer.decode(o.token_ids)
+    except Exception:
+        pass
+    return ""
+
+def trt_generate_texts(
+    prompts: List[str],
+    sampling_params: SamplingParams,
+    logits_processor=None,
+) -> List[str]:
+    outs = llm.generate(
+        prompts,
+        sampling_params=sampling_params,
+        logits_processor=logits_processor,
+    )
+    texts: List[str] = []
+    for o in outs:
+        texts.append(_extract_text_from_generate_output(o))
+    return texts
 
 # -----------------------
 # OpenAI-compatible API
@@ -413,9 +451,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if logits_processor is None:
             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
 
-    # Keep per-request generation short to match small prompt/output assumption
     max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 128
-
     sampling_params = build_sampling_params(
         max_new_tokens=max_new_tokens,
         num_beams=int(req.num_beams or 10),
