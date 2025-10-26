@@ -1,23 +1,20 @@
 [project]
 name = "wordlist-generation"
-version = "0.1.0"
+version = "0.2.0"
 description = "Vocabulary-constrained generation server (FastAPI + TensorRT-LLM + lm-format-enforcer)"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"  # match TRT-LLM container's Python (3.10)
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "fastapi[standard]",
+    "httpx",
+    "lm-format-enforcer>=0.10.0",
     "pydantic>=2",
     "python-dotenv",
-    "pynvml>=11.5.0",
-    "lm-format-enforcer>=0.10.0",
-    "huggingface_hub",
-    # For chat templates:
-    "transformers",
+    "transformers>=4.44",
+    "tiktoken",
     "sentencepiece",
 ]
-
 [dependency-groups]
 dev = ["ruff"]
-
 [tool.setuptools]
-py-modules = ["server_trtllm"]
+py-modules = ["server"]
