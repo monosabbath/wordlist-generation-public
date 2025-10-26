@@ -1,29 +1,23 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
-description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
+description = "Vocabulary-constrained generation server (FastAPI + TensorRT-LLM + lm-format-enforcer)"
 readme = "README.md"
-requires-python = ">=3.12, <3.14"
+requires-python = ">=3.10,<3.13"  # match TRT-LLM container's Python (3.10)
 dependencies = [
-    "accelerate",
     "fastapi[standard]",
-    "httpx",
-    "lm-format-enforcer>=0.10.0",  # ensure integrations module is present
     "pydantic>=2",
     "python-dotenv",
-    "safetensors",                  # recommended for HF models
-    "torch",                        # pin per your CUDA/PyTorch stack if needed
-    "transformers",                 # consider a range pin in prod, e.g. >=4.44,<4.46
-    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "compressed-tensors",
-    "tiktoken",
+    "pynvml>=11.5.0",
+    "lm-format-enforcer>=0.10.0",
+    "huggingface_hub",
+    # For chat templates:
+    "transformers",
     "sentencepiece",
 ]
 
 [dependency-groups]
-dev = [
-    "ruff",
-]
+dev = ["ruff"]
 
 [tool.setuptools]
-py-modules = ["server"]
+py-modules = ["server_trtllm"]
