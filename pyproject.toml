@@ -7,7 +7,7 @@ requires-python = ">=3.10,<3.13"
 dependencies = [
     "fastapi[standard]",
     "httpx",
-    "lm-format-enforcer>=0.10.0",
+    "lm-format-enforcer>=0.11.2",
     "pydantic>=2",
     "python-dotenv",
     "transformers>=4.44",
