@@ -1,0 +1,12 @@
+# Example: single-GPU or simple setup
+tensor_parallel_size: 1
+moe_expert_parallel_size: 1
+moe_tensor_parallel_size: 1
+enable_attention_dp: false
+
+# For multi-GPU MoE, replace with something like:
+# tensor_parallel_size: 8
+# moe_expert_parallel_size: 8
+# moe_tensor_parallel_size: 1
+# enable_attention_dp: false
+# context_parallel_size: 1
