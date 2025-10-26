@@ -9,7 +9,7 @@ import logging
 from functools import cache
 from typing import Optional, Dict, Any, List
 
-import torch  # noqa: F401
+import torch  # required for building input tensors
 import yaml
 from fastapi import (
     Depends,
@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("vocab-constrained-trtllm")
+
 app = FastAPI()
 
 # -----------------------
@@ -67,7 +68,6 @@ MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))
 MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))
 MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", str(MAX_SEQ_LEN)))
 KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "auto").lower()
-
 PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
 
 # Batch jobs
@@ -102,7 +102,6 @@ llm_kwargs: Dict[str, Any] = dict(
     max_seq_len=MAX_SEQ_LEN,
     max_num_tokens=MAX_NUM_TOKENS,
 )
-
 if kv_cfg is not None:
     llm_kwargs["kv_cache_config"] = kv_cfg
 
@@ -119,6 +118,7 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
         moe_ep = cfg.get("moe_expert_parallel_size") or cfg.get("moe_ep")
         gpn = cfg.get("gpus_per_node")
         enable_attention_dp = bool(cfg.get("enable_attention_dp", False))
+
         llm_kwargs.update(
             tensor_parallel_size=int(tp),
             pipeline_parallel_size=int(pp),
@@ -131,6 +131,7 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
             llm_kwargs["moe_expert_parallel_size"] = int(moe_ep)
         if gpn is not None:
             llm_kwargs["gpus_per_node"] = int(gpn)
+
         logger.info(
             f"LLM parallel settings -> TP={llm_kwargs.get('tensor_parallel_size', 1)}, "
             f"PP={llm_kwargs.get('pipeline_parallel_size', 1)}, "
@@ -147,6 +148,30 @@ else:
 
 llm = LLM(**llm_kwargs)
 
+# -----------------------
+# Warmup helper (to create runtime once)
+# -----------------------
+def ensure_trt_runtime_ready():
+    # Lazily initialize the TRT-LLM runtime so llm.runtime_context is not None.
+    if getattr(llm, "runtime_context", None) is None or getattr(llm.runtime_context, "runtime", None) is None:
+        try:
+            # Try convenience signature first
+            llm.generate(" ", max_new_tokens=1)
+            logger.info("TRT-LLM warmup: runtime initialized using convenience generate()")
+        except TypeError:
+            # Fall back to explicit SamplingParams for older/newer versions
+            try:
+                from tensorrt_llm.llmapi import SamplingParams as LLMAPISamplingParams  # type: ignore
+                llm.generate(" ", LLMAPISamplingParams(max_tokens=1))
+                logger.info("TRT-LLM warmup: runtime initialized using LLMAPISamplingParams")
+            except Exception as e2:
+                logger.warning(f"TRT-LLM warmup via LLMAPISamplingParams failed: {e2}")
+        except Exception as e:
+            logger.warning(f"TRT-LLM warmup failed (runtime may still be uninitialized): {e}")
+
+# Proactively warm up runtime to avoid first-request latency and None runtime_context
+ensure_trt_runtime_ready()
+
 logger.info(
     "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
     MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
@@ -161,12 +186,17 @@ if chat_tokenizer.pad_token_id is None and chat_tokenizer.eos_token_id is not No
 # Helpers for stop tokens
 # -----------------------
 def _runtime_tokenizer():
-    return llm.runtime_context.tokenizer
+    # Prefer TRT-LLM runtime tokenizer if runtime is initialized;
+    # otherwise fall back to the HF tokenizer.
+    ctx = getattr(llm, "runtime_context", None)
+    if ctx is not None and getattr(ctx, "tokenizer", None) is not None:
+        return ctx.tokenizer
+    return chat_tokenizer
 
 @cache
 def get_eos_id() -> int:
-    rt = _runtime_tokenizer()
-    eos_id = getattr(rt, "eos_token_id", None)
+    tok = _runtime_tokenizer()
+    eos_id = getattr(tok, "eos_token_id", None)
     if eos_id is None:
         eos_id = chat_tokenizer.eos_token_id
     if eos_id is None:
@@ -175,8 +205,8 @@ def get_eos_id() -> int:
 
 @cache
 def get_pad_id() -> int:
-    rt = _runtime_tokenizer()
-    pad_id = getattr(rt, "pad_token_id", None)
+    tok = _runtime_tokenizer()
+    pad_id = getattr(tok, "pad_token_id", None)
     if pad_id is None:
         pad_id = chat_tokenizer.pad_token_id
     if pad_id is None:
@@ -271,12 +301,14 @@ def build_regex_grammar(lang: str, n_words: int) -> Optional[str]:
     return fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
 def build_logits_processor_for(lang: str, n_words: int):
+    # Ensure runtime is ready so we prefer TRT tokenizer if available
+    ensure_trt_runtime_ready()
     grammar = build_regex_grammar(lang, n_words)
     if not grammar:
         return None
     parser = RegexParser(grammar)
-    rt_tok = _runtime_tokenizer()
-    return build_trtllm_logits_processor(rt_tok, parser)
+    tok = _runtime_tokenizer()  # TRT tokenizer if available; HF fallback otherwise
+    return build_trtllm_logits_processor(tok, parser)
 
 # Startup prebuilds (optional)
 if PREBUILD_PREFIX:
@@ -363,14 +395,20 @@ def trt_runtime_generate_texts(
     runtime_sampling_config: RuntimeSamplingConfig,
     logits_processor,
 ) -> List[str]:
-    # Use the tokenizer that the TRT runtime uses
+    # Ensure TRT-LLM runtime is ready before low-level generate
+    ensure_trt_runtime_ready()
+    rt_ctx = getattr(llm, "runtime_context", None)
+    if rt_ctx is None or getattr(rt_ctx, "runtime", None) is None:
+        raise RuntimeError("TRT-LLM runtime is not initialized. See logs for warmup failures.")
+
     tokenizer = _runtime_tokenizer()
     # Encode batch
-    batch_enc = tokenizer.batch_encode_plus(prompts)["input_ids"]
+    enc = tokenizer.batch_encode_plus(prompts)
+    batch_enc = enc["input_ids"]
     inputs = torch.LongTensor(batch_enc)
 
     # Call the low-level runtime API with logits_processor
-    out = llm.runtime_context.runtime.generate(
+    out = rt_ctx.runtime.generate(
         inputs,
         sampling_config=runtime_sampling_config,
         logits_processor=logits_processor,
@@ -416,6 +454,9 @@ def list_models(auth_ok: bool = Depends(verify_token)):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_token)):
+    # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
+    ensure_trt_runtime_ready()
+
     # Require constrained config
     if not req.vocab_lang or not req.vocab_n_words:
         raise HTTPException(status_code=400, detail="vocab_lang and vocab_n_words are required for constrained decoding.")
@@ -479,6 +520,7 @@ def process_batch_job(
     logger.info(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
+
         with open(input_path, "r", encoding="utf-8") as f:
             raw_requests = json.load(f)
         if not isinstance(raw_requests, list):
@@ -505,9 +547,11 @@ def process_batch_job(
         length_penalty = float(job_config.get("length_penalty", 1.0))
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
-
         if not vocab_lang or not vocab_n_words:
             raise ValueError("vocab_lang and vocab_n_words are required for constrained decoding batch jobs.")
+
+        # Ensure runtime is ready early so eos/pad IDs come from TRT tokenizer
+        ensure_trt_runtime_ready()
 
         runtime_cfg = build_runtime_sampling_config(max_tokens, num_beams, length_penalty)
         logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
@@ -590,6 +634,7 @@ def create_batch_job(
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
     }
+
     JOB_STATUS[job_id] = {
         "status": "pending",
         "input_path": input_path,
@@ -597,7 +642,9 @@ def create_batch_job(
         "submitted_at": int(time.time()),
         "config": job_config,
     }
+
     background_tasks.add_task(process_batch_job, job_id, input_path, output_path, job_config)
+
     return {
         "job_id": job_id,
         "status": "pending",
