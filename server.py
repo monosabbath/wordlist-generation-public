@@ -60,8 +60,11 @@ PREBUILD_WORD_COUNTS = tuple(
 )
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
+# Beam width: single source of truth is NUM_BEAMS.
+# Backward-compat: fall back to MAX_BEAM_WIDTH env if NUM_BEAMS not set.
+NUM_BEAMS = int(os.getenv("NUM_BEAMS") or os.getenv("MAX_BEAM_WIDTH", "1"))
+
 # TRT-LLM memory caps (keep modest to avoid OOM; adjust via env as needed)
-MAX_BEAM_WIDTH = int(os.getenv("MAX_BEAM_WIDTH", "10"))
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1"))
 MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))
 MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "1024"))
@@ -90,7 +93,7 @@ elif KV_CACHE_DTYPE not in ("auto", ""):
 llm_kwargs: Dict[str, Any] = dict(
     model=MODEL_NAME,
     enable_trtllm_sampler=True,  # harmless here; we use runtime API for generation
-    max_beam_width=MAX_BEAM_WIDTH,
+    max_beam_width=NUM_BEAMS,    # Engine configured for this beam width
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
     trust_remote_code=True,
@@ -150,26 +153,52 @@ llm = LLM(**llm_kwargs)
 def ensure_trt_runtime_ready():
     # Lazily initialize the TRT-LLM runtime so llm.runtime_context is not None.
     if getattr(llm, "runtime_context", None) is None or getattr(llm.runtime_context, "runtime", None) is None:
+        # Try convenience generate() with num_beams/beam_width to match engine
         try:
-            # Try convenience signature first
-            llm.generate(" ", max_new_tokens=1)
-            logger.info("TRT-LLM warmup: runtime initialized using convenience generate()")
+            llm.generate(" ", max_new_tokens=1, num_beams=NUM_BEAMS)
+            logger.info("TRT-LLM warmup: runtime initialized using generate(num_beams)")
+            return
         except TypeError:
-            # Fall back to explicit SamplingParams for older/newer versions
-            try:
-                from tensorrt_llm.llmapi import SamplingParams as LLMAPISamplingParams  # type: ignore
-                llm.generate(" ", LLMAPISamplingParams(max_tokens=1))
-                logger.info("TRT-LLM warmup: runtime initialized using LLMAPISamplingParams")
-            except Exception as e2:
-                logger.warning(f"TRT-LLM warmup via LLMAPISamplingParams failed: {e2}")
-        except Exception as e:
-            logger.warning(f"TRT-LLM warmup failed (runtime may still be uninitialized): {e}")
+            pass
+        except AssertionError as e:
+            logger.warning(f"Warmup via generate(num_beams) hit assertion: {e}")
+
+        try:
+            llm.generate(" ", max_new_tokens=1, beam_width=NUM_BEAMS)  # some builds use 'beam_width'
+            logger.info("TRT-LLM warmup: runtime initialized using generate(beam_width)")
+            return
+        except TypeError:
+            pass
+        except AssertionError as e:
+            logger.warning(f"Warmup via generate(beam_width) hit assertion: {e}")
+
+        # Fall back to explicit LLM API SamplingParams for older/newer versions
+        try:
+            from tensorrt_llm.llmapi import SamplingParams as LLMAPISamplingParams  # type: ignore
+            last_exc = None
+            for kw in (
+                dict(max_tokens=1, beam_width=NUM_BEAMS),
+                dict(max_tokens=1, num_beams=NUM_BEAMS),
+            ):
+                try:
+                    llm.generate(" ", LLMAPISamplingParams(**kw))
+                    logger.info(f"TRT-LLM warmup: runtime initialized using LLMAPISamplingParams {kw}")
+                    return
+                except Exception as e:
+                    last_exc = e
+            if last_exc:
+                raise last_exc
+        except Exception as e2:
+            logger.warning(f"TRT-LLM warmup via LLMAPISamplingParams failed: {e2}")
+
+        # If all fail, log a warning; runtime may still initialize on first request
+        logger.warning("TRT-LLM warmup did not complete; runtime will initialize on first request.")
 
 # Proactively warm up runtime to avoid first-request latency and None runtime_context
 ensure_trt_runtime_ready()
 logger.info(
-    "TRT-LLM limits -> batch=%s, beam=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
-    MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
+    "TRT-LLM limits -> batch=%s, num_beams=%s, input=%s, seq=%s, num_tokens=%s, kv_override=%s",
+    MAX_BATCH_SIZE, NUM_BEAMS, MAX_INPUT_LEN, MAX_SEQ_LEN, MAX_NUM_TOKENS, KV_CACHE_DTYPE
 )
 
 # HF tokenizer only to render chat templates (no weights loaded)
@@ -366,7 +395,7 @@ def build_runtime_sampling_config(
 ) -> RuntimeSamplingConfig:
     eos = get_eos_id()
     pad = get_pad_id()
-    nb = MAX_BEAM_WIDTH
+    nb = NUM_BEAMS
     # Beam search: enforce temperature 0.0; greedy (nb=1) uses temperature 1.0
     temperature = 0.0 if nb > 1 else 1.0
     top_k = 1
