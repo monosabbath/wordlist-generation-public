@@ -59,13 +59,23 @@ PREBUILD_WORD_COUNTS = tuple(
 )
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
-# TRT-LLM config
+# TRT-LLM memory caps (critical to avoid Sampler OOM; keep small if using large beam width)
 MAX_BEAM_WIDTH = int(os.getenv("MAX_BEAM_WIDTH", "10"))
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "1"))
+MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "512"))      # tokens of prompt (cap small)
+MAX_OUTPUT_LEN = int(os.getenv("MAX_OUTPUT_LEN", "256"))    # tokens of generation (cap small)
+# Total sequence length caps
+MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", str(MAX_INPUT_LEN + MAX_OUTPUT_LEN)))
+MAX_ATTENTION_WINDOW = int(os.getenv("MAX_ATTENTION_WINDOW", str(MAX_SEQ_LEN)))
+MAX_NUM_TOKENS = int(os.getenv("MAX_NUM_TOKENS", str(MAX_SEQ_LEN)))
+KV_CACHE_DTYPE = os.getenv("KV_CACHE_DTYPE", "fp16")        # "fp16" or "bf16"; "fp8" only on H100
+
 PARALLEL_CONFIG_PATH = os.getenv("PARALLEL_CONFIG_PATH", None)
 
 # Batch jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
+
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size (unused by TRT-LLM scheduler): {BATCH_JOB_PIPELINE_SIZE}")
 
@@ -81,6 +91,15 @@ llm_kwargs: Dict[str, Any] = dict(
     disable_overlap_scheduler=True,
     cuda_graph_config=None,
     trust_remote_code=True,  # often needed for chat template
+
+    # Memory limiting (keeps Sampler allocations small even with large beam width)
+    max_batch_size=MAX_BATCH_SIZE,
+    max_input_len=MAX_INPUT_LEN,
+    max_output_len=MAX_OUTPUT_LEN,
+    max_seq_len=MAX_SEQ_LEN,
+    max_num_tokens=MAX_NUM_TOKENS,
+    max_attention_window_size=MAX_ATTENTION_WINDOW,
+    kv_cache_dtype=KV_CACHE_DTYPE,
 )
 
 # Map parallel_config.yaml to supported LLM kwargs (TP/PP/CP/MoE/attention DP/etc.)
@@ -89,7 +108,6 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
     try:
         with open(PARALLEL_CONFIG_PATH, "r") as f:
             cfg = yaml.safe_load(f) or {}
-
         tp = cfg.get("tensor_parallel_size") or cfg.get("tp_size") or cfg.get("tp") or 1
         pp = cfg.get("pipeline_parallel_size") or cfg.get("pp_size") or cfg.get("pp") or 1
         cp = cfg.get("context_parallel_size") or cfg.get("cp_size") or cfg.get("cp") or 1
@@ -97,7 +115,6 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
         moe_ep = cfg.get("moe_expert_parallel_size") or cfg.get("moe_ep")
         gpn = cfg.get("gpus_per_node")
         enable_attention_dp = bool(cfg.get("enable_attention_dp", False))
-
         llm_kwargs.update(
             tensor_parallel_size=int(tp),
             pipeline_parallel_size=int(pp),
@@ -110,7 +127,6 @@ if PARALLEL_CONFIG_PATH and os.path.exists(PARALLEL_CONFIG_PATH):
             llm_kwargs["moe_expert_parallel_size"] = int(moe_ep)
         if gpn is not None:
             llm_kwargs["gpus_per_node"] = int(gpn)
-
         logger.info(
             f"LLM parallel settings -> TP={llm_kwargs.get('tensor_parallel_size', 1)}, "
             f"PP={llm_kwargs.get('pipeline_parallel_size', 1)}, "
@@ -127,6 +143,13 @@ else:
 
 llm = LLM(**llm_kwargs)
 trt_tokenizer = llm.tokenizer
+
+# Log effective caps to confirm
+logger.info(
+    "TRT-LLM limits -> batch=%s, beam=%s, input=%s, output=%s, seq=%s, attn_win=%s, num_tokens=%s, kv=%s",
+    MAX_BATCH_SIZE, MAX_BEAM_WIDTH, MAX_INPUT_LEN, MAX_OUTPUT_LEN,
+    MAX_SEQ_LEN, MAX_ATTENTION_WINDOW, MAX_NUM_TOKENS, KV_CACHE_DTYPE
+)
 
 # HF tokenizer only to render chat templates (no weights loaded)
 chat_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
@@ -400,17 +423,24 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     messages = [{"role": m.role, "content": m.content} for m in req.messages]
     text_prompt = apply_chat_template(messages)
 
+    # Constrained vocab
     logits_processor = None
     if req.vocab_lang and req.vocab_n_words:
         logits_processor = build_logits_processor_for(req.vocab_lang, req.vocab_n_words)
         if logits_processor is None:
             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
 
-    max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 512
+    # Clamp to engine caps
+    max_new_tokens_req = int(req.max_tokens) if req.max_tokens is not None else min(128, MAX_OUTPUT_LEN)
+    max_new_tokens = max(1, min(max_new_tokens_req, MAX_OUTPUT_LEN))
+    num_beams_req = int(req.num_beams or MAX_BEAM_WIDTH)
+    num_beams = max(1, min(num_beams_req, MAX_BEAM_WIDTH))
+    length_penalty = float(req.length_penalty if req.length_penalty is not None else 1.0)
+
     sampling_params = build_sampling_params(
         max_new_tokens=max_new_tokens,
-        num_beams=int(req.num_beams or 10),
-        length_penalty=float(req.length_penalty if req.length_penalty is not None else 1.0),
+        num_beams=num_beams,
+        length_penalty=length_penalty,
     )
 
     start = time.time()
@@ -418,8 +448,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     text = outputs[0] if outputs else ""
     elapsed = time.time() - start
     logger.info(f"Generated in {elapsed:.2f}s")
-
     created = int(time.time())
+
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -476,9 +506,13 @@ def process_batch_job(
         if not prompts:
             raise ValueError("No valid requests in batch.")
 
-        max_tokens = int(job_config.get("max_tokens", 512))
-        num_beams = int(job_config.get("num_beams", 10))
+        # Clamp to engine caps (batch job config)
+        max_tokens_req = int(job_config.get("max_tokens", min(128, MAX_OUTPUT_LEN)))
+        max_tokens = max(1, min(max_tokens_req, MAX_OUTPUT_LEN))
+        num_beams_req = int(job_config.get("num_beams", MAX_BEAM_WIDTH))
+        num_beams = max(1, min(num_beams_req, MAX_BEAM_WIDTH))
         length_penalty = float(job_config.get("length_penalty", 1.0))
+
         sampling_params = build_sampling_params(max_tokens, num_beams, length_penalty)
 
         vocab_lang = job_config.get("vocab_lang")
@@ -521,6 +555,7 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
+
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
@@ -538,8 +573,8 @@ def create_batch_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
-    max_tokens: int = 512,
-    num_beams: int = 10,
+    max_tokens: int = min(128, MAX_OUTPUT_LEN),
+    num_beams: int = MAX_BEAM_WIDTH,
     length_penalty: float = 1.0,
     vocab_lang: Optional[str] = None,
     vocab_n_words: Optional[int] = None,
@@ -555,10 +590,11 @@ def create_batch_job(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save input file: {e}")
 
+    # Clamp to engine caps
     job_config = {
-        "max_tokens": max_tokens,
-        "num_beams": num_beams,
-        "length_penalty": length_penalty,
+        "max_tokens": max(1, min(int(max_tokens), MAX_OUTPUT_LEN)),
+        "num_beams": max(1, min(int(num_beams), MAX_BEAM_WIDTH)),
+        "length_penalty": float(length_penalty),
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
     }
