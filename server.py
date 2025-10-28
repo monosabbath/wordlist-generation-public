@@ -9,7 +9,6 @@ import logging
 import datetime
 from functools import cache
 from typing import Optional, Dict, Any, List
-
 import torch
 import torch.distributed as dist
 from fastapi import (
@@ -36,7 +35,6 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
-
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -48,7 +46,6 @@ from transformers import (
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("vocab-constrained")
-
 app = FastAPI()
 
 # -----------------------
@@ -66,7 +63,6 @@ if PARALLEL_MODE not in ("tp", "device_map"):
 
 # If TP is requested but distributed env is not ready, optionally fall back
 TP_FALLBACK_TO_DEVICE_MAP = os.getenv("TP_FALLBACK_TO_DEVICE_MAP", "true").lower() == "true"
-
 DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used only when PARALLEL_MODE=device_map
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
@@ -78,16 +74,16 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
-
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
-
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
 # Constrained vocab prebuild
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
-PREBUILD_WORD_COUNTS = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
+PREBUILD_WORD_COUNTS = tuple(
+    int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
+)
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
 # Torch dtype
@@ -198,6 +194,12 @@ if STATIC_KV_CACHE:
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
+# Globally ask tokenizer not to return token_type_ids (helps pipeline path too)
+if hasattr(tokenizer, "return_token_type_ids"):
+    try:
+        tokenizer.return_token_type_ids = False
+    except Exception:
+        pass
 
 model.eval()
 
@@ -230,14 +232,6 @@ def tokenizer_encode_for_chat(texts: Any) -> Dict[str, torch.Tensor]:
         "return_token_type_ids": False,  # IMPORTANT: avoid passing token_type_ids to generate()
     }
     return tokenizer(texts, **tok_kwargs)
-
-def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """
-    Remove keys that the model/generate doesn't accept, like token_type_ids.
-    """
-    inputs = dict(inputs)
-    inputs.pop("token_type_ids", None)
-    return inputs
 
 def normalize_max_new_tokens(requested: Optional[int]) -> int:
     """
@@ -298,7 +292,6 @@ def normalizeword(w: str) -> str:
 
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
-
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
@@ -336,7 +329,6 @@ def trieto_regex(node: _TrieNode, nlimit: int) -> str:
     return "(?:" + "|".join(alts) + ")"
 
 TRIECACHE: Dict[str, Dict[str, Any]] = {}
-
 def _safe_lang_name(lang: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", lang))
 
@@ -380,18 +372,14 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     stop_ids = set(get_stop_ids(tokenizer))
-
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
-
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested) — do on rank 0 only
@@ -490,38 +478,32 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role == "system":
             system_prompt = msg.content
             break
-
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
     for msg in req.messages:
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
-
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     if MODEL_NAME == "zai-org/GLM-4.6-FP8":
         logger.info("Applying 'enable_thinking: False' for GLM-4.6-FP8.")
         template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
-    # Drop keys not accepted by model.generate()
-    inputs = strip_unused_model_inputs(inputs)
     inputs = move_inputs_to_correct_device(inputs, model)
+    # Strip keys not accepted by this model/generate call
+    inputs.pop("token_type_ids", None)
 
     input_len = inputs["input_ids"].shape[1]
-
     prefix_fn = None
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
         if prefix_fn is None:
             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
-
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
-
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -529,7 +511,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         length_penalty=req.length_penalty if req.length_penalty is not None else 1.0,
         prefix_fn=prefix_fn
     )
-
     with torch.inference_mode():
         outputs = model.generate(**inputs, **gen_kwargs)
 
@@ -537,12 +518,10 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
-
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
     created = int(time.time())
-
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -567,7 +546,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 # BATCH JOB API
 # ---------------------------------------------------
 JOB_STATUS: Dict[str, Dict[str, Any]] = {}
-
 def process_batch_job(
     job_id: str,
     input_path: str,
@@ -577,7 +555,6 @@ def process_batch_job(
     logger.info(f"[Job {job_id}] Starting processing...")
     try:
         JOB_STATUS[job_id]["status"] = "processing"
-
         # 1. Read and parse the input file
         prompts = []
         raw_requests = []
@@ -588,42 +565,35 @@ def process_batch_job(
                     raise ValueError("Input file must contain a JSON list.")
             except json.JSONDecodeError as e:
                 raise ValueError(f"Failed to parse JSON: {e}")
-
         # 2. Prepare all prompts
         logger.info(f"[Job {job_id}] Preparing {len(raw_requests)} prompts...")
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
-
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 if MODEL_NAME == "zai-org/GLM-4.6-FP8":
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
             except ValidationError as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Error processing. {e}")
-
         # 3. Prepare shared generation kwargs for the entire batch job
         stop_ids = get_stop_ids(tokenizer)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
-
         max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512))
         generation_kwargs = dict(
             max_new_tokens=max_new_tokens,
@@ -633,7 +603,6 @@ def process_batch_job(
             eos_token_id=stop_ids,
             pad_token_id=tokenizer.pad_token_id,
         )
-
         # Build prefix function if vocab is constrained
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
@@ -645,7 +614,6 @@ def process_batch_job(
                 logger.info(f"[Job {job_id}] Successfully added prefix function.")
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
-
         # 4. Run the pipeline with padding/truncation controls
         logger.info(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
         results = []
@@ -656,12 +624,10 @@ def process_batch_job(
             padding=True,
             truncation=True,
             pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length
-            return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
+            max_length=MAX_INPUT_TOKENS,
             **generation_kwargs,
         ):
             results.append(output[0]["generated_text"])
-
         # 5. Format and save the output file
         logger.info(f"[Job {job_id}] Formatting and saving results...")
         created = int(time.time())
@@ -686,10 +652,8 @@ def process_batch_job(
                 },
             }
             final_output.append(resp)
-
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(final_output, f, indent=2)
-
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
     except Exception as e:
@@ -719,13 +683,11 @@ def create_batch_job(
     job_id = str(uuid.uuid4())
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
-
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save input file: {e}")
-
     job_config = {
         "max_tokens": max_tokens,
         "num_beams": num_beams,
@@ -733,7 +695,6 @@ def create_batch_job(
         "vocab_lang": vocab_lang,
         "vocab_n_words": vocab_n_words,
     }
-
     JOB_STATUS[job_id] = {
         "status": "pending",
         "input_path": input_path,
@@ -741,11 +702,9 @@ def create_batch_job(
         "submitted_at": int(time.time()),
         "config": job_config,
     }
-
     background_tasks.add_task(
         process_batch_job, job_id, input_path, output_path, job_config
     )
-
     return {
         "job_id": job_id,
         "status": "pending",
@@ -771,7 +730,6 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
