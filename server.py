@@ -27,6 +27,9 @@ from dotenv import load_dotenv
 # Load environment as early as possible
 load_dotenv()
 
+# Torch/backends knobs
+torch.backends.cuda.matmul.allow_tf32 = True
+
 from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
@@ -48,10 +51,30 @@ app = FastAPI()
 # -----------------------
 # Config via environment
 # -----------------------
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-4B-Instruct-2507")
-DEVICE_MAP = os.getenv("DEVICE_MAP", "cuda")  # e.g., "cuda" or "auto"
+MODEL_NAME = os.getenv("MODEL_NAME", "zai-org/GLM-4.6")
+# PARALLEL_MODE: "tp" or "device_map"
+PARALLEL_MODE = os.getenv("PARALLEL_MODE", "device_map").strip().lower()
+if PARALLEL_MODE not in ("tp", "device_map"):
+    logger.warning(f"Invalid PARALLEL_MODE={PARALLEL_MODE}, defaulting to 'device_map'")
+    PARALLEL_MODE = "device_map"
+
+DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used only when PARALLEL_MODE=device_map
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
+
+# Attention implementation preference
+ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").strip()
+
+# Padding/length controls
+TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
+PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
+MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
+ALLOWED_MAX_NEW_TOKENS = tuple(
+    sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
+)
+STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
+
+# Constrained vocab prebuild
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
@@ -59,6 +82,7 @@ PREBUILD_WORD_COUNTS = tuple(
 # Optional: languages to prebuild, comma-separated. If empty, skip prebuild.
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
+# Torch dtype
 TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 
 # Config for Batch Jobs
@@ -82,18 +106,58 @@ else:
     TORCH_DTYPE = "auto"
     logger.info("Using torch_dtype: auto")
 
-model_init_kwargs = {
-    "device_map": DEVICE_MAP,
+# Prepare model init kwargs per PARALLEL_MODE
+model_init_kwargs: Dict[str, Any] = {
     "trust_remote_code": TRUST_REMOTE_CODE,
     "torch_dtype": TORCH_DTYPE,
 }
+if PARALLEL_MODE == "tp":
+    # Tensor Parallel mode path
+    model_init_kwargs["tp_plan"] = "auto"
+    logger.info("Loading model in Tensor Parallel (tp_plan='auto') mode")
+else:
+    # device_map path
+    model_init_kwargs["device_map"] = DEVICE_MAP
+    logger.info(f"Loading model with device_map='{DEVICE_MAP}'")
 
-logger.info(f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE})...")
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    **model_init_kwargs,
+# Attention impl preference
+attn_impl = ATTN_IMPLEMENTATION
+
+logger.info(
+    f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}')..."
 )
+try:
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        attn_implementation=attn_impl,
+        **model_init_kwargs,
+    )
+except TypeError:
+    logger.warning("Model.from_pretrained() did not accept 'attn_implementation'; loading without it.")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_NAME,
+        **model_init_kwargs,
+    )
+    # Try to set after load
+    try:
+        model.set_attention_implementation(attn_impl)
+    except Exception as e:
+        logger.warning(f"Could not set attention implementation to '{attn_impl}': {e}. Falling back to SDPA.")
+        try:
+            model.set_attention_implementation("sdpa")
+        except Exception as e2:
+            logger.warning(f"Could not set SDPA either: {e2}")
+
+# Optional: static KV cache (advanced; only enable if you can keep shapes consistent)
+if STATIC_KV_CACHE:
+    try:
+        model.generation_config.cache_implementation = "static"
+        logger.info("Enabled static KV cache (model.generation_config.cache_implementation='static').")
+    except Exception as e:
+        logger.warning(f"Static KV cache not available: {e}")
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
+tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
 model.eval()
 
 # Ensure a pad token is set to avoid warnings/problems during generation
@@ -106,8 +170,7 @@ if tokenizer.pad_token_id is None:
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], m):
     """
     Always move inputs to the device of the model's first parameter.
-    This avoids the generate() warning about mismatched devices and works
-    well even for sharded models (Accelerate will handle dispatching).
+    Works for both device_map and TP-sharded models (first param device is fine).
     """
     try:
         device = next(m.parameters()).device
@@ -115,12 +178,37 @@ def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], m):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return {k: v.to(device) for k, v in inputs.items()}
 
-def tokenizer_encode_for_chat(text: str) -> Dict[str, torch.Tensor]:
+
+def tokenizer_encode_for_chat(texts: Any) -> Dict[str, torch.Tensor]:
+    # texts can be str or List[str]
+    tok_kwargs: Dict[str, Any] = {
+        "return_tensors": "pt",
+        "padding": True,
+        "truncation": True,
+        "pad_to_multiple_of": PAD_TO_MULTIPLE_OF,
+        "max_length": MAX_INPUT_TOKENS,
+    }
     # Conditionally disable token_type_ids for GLM-4.6-FP8 only
-    tok_kwargs = {"return_tensors": "pt"}
     if MODEL_NAME == "zai-org/GLM-4.6-FP8":
         tok_kwargs["return_token_type_ids"] = False
-    return tokenizer(text, **tok_kwargs)
+    return tokenizer(texts, **tok_kwargs)
+
+
+def normalize_max_new_tokens(requested: Optional[int]) -> int:
+    """
+    Cap to 512 and round up to the nearest allowed value to stabilize shapes.
+    Allowed set from ALLOWED_MAX_NEW_TOKENS.
+    """
+    if not ALLOWED_MAX_NEW_TOKENS:
+        return min(int(requested) if requested else 512, 512)
+    target = int(requested) if requested is not None else 512
+    target = min(target, 512)
+    # round up to the next allowed value >= target
+    for a in ALLOWED_MAX_NEW_TOKENS:
+        if target <= a:
+            return a
+    return ALLOWED_MAX_NEW_TOKENS[-1]
+
 
 # -----------------------
 # Create the generation pipeline
@@ -153,11 +241,11 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
     for special in common_end_markers:
         try:
             eid = tok.convert_tokens_to_ids(special)
-            if eid is not None and eid != tok.unk_token_id:
+            if eid is not None and eid != tok.unk_token_id and eid != -1:
                 stop_ids.append(eid)
         except Exception:
             pass
-    # unique
+    # Unique
     return list(set(stop_ids))
 
 # -----------------------
@@ -167,12 +255,15 @@ def normalizeword(w: str) -> str:
     # Normalize Unicode and keep accents; enforce lowercase
     return unicodedata.normalize("NFC", w.strip()).lower()
 
+
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
+
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
         self.min_rank: int = 10**12
+
 
 def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
     root = _TrieNode()
@@ -187,8 +278,10 @@ def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
         node.end = True
     return root
 
+
 def escapefor_regex(ch: str) -> str:
     return re.escape(ch)
+
 
 def trieto_regex(node: _TrieNode, nlimit: int) -> str:
     # Returns a regex for all suffixes from this node, pruned by n_limit.
@@ -208,11 +301,14 @@ def trieto_regex(node: _TrieNode, nlimit: int) -> str:
         return alts[0]
     return "(?:" + "|".join(alts) + ")"
 
+
 TRIECACHE: Dict[str, Dict[str, Any]] = {}
+
 
 def _safe_lang_name(lang: str) -> bool:
     # Prevent path traversal; only allow simple alphanum, underscore, dash
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", lang))
+
 
 def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     if not _safe_lang_name(lang):
@@ -236,6 +332,7 @@ def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     TRIECACHE[lang] = {"trie": trie}
     return TRIECACHE[lang]
 
+
 def buildword_regex_for_n(lang: str, n_words: int) -> Optional[str]:
     data = getor_build_trie(lang)
     if data is None:
@@ -245,26 +342,23 @@ def buildword_regex_for_n(lang: str, n_words: int) -> Optional[str]:
         return None
     return trieto_regex(trie, nlimit=n_words)
 
+
 @cache
 def build_regexp_prefix_fn(lang: str, n_words: int):
     logger.info(f"building prefix function for {lang} ({n_words} words)")
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
-
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     # Punctuation between words; includes spaces/newlines and common punctuation
     punct_regex = r'[.,!?¿¡…\s]+'
     # Full-string grammar (not anchored, per user preference)
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -273,6 +367,7 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
         return list(allowed | stop_ids)
 
     return wrapped_prefix_fn
+
 
 # Startup prebuilds (if requested)
 if PREBUILD_PREFIX:
@@ -370,7 +465,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role == "system":
             system_prompt = msg.content
             break
-
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
@@ -388,15 +482,11 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)
 
-    # Conditionally suppress token_type_ids only for GLM-4.6-FP8
-    tok_kwargs = {"return_tensors": "pt"}
-    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
-        tok_kwargs["return_token_type_ids"] = False
-    inputs = tokenizer(texts, **tok_kwargs)
+    # Tokenize with left padding, truncation, pad_to_multiple_of
+    inputs = tokenizer_encode_for_chat(texts)
 
     # Always move inputs onto the model's main device to avoid device mismatch warnings
     inputs = move_inputs_to_correct_device(inputs, model)
-
     input_len = inputs["input_ids"].shape[1]
 
     prefix_fn = None
@@ -405,9 +495,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if prefix_fn is None:
             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
 
-    max_new_tokens = int(req.max_tokens) if req.max_tokens is not None else 512
+    max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
-
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -423,13 +512,11 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
-
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
     created = int(time.time())
-
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -487,18 +574,15 @@ def process_batch_job(
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
-
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 if MODEL_NAME == "zai-org/GLM-4.6-FP8":
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
             except ValidationError as e:
@@ -511,8 +595,11 @@ def process_batch_job(
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
+        # Normalize max tokens per our policy
+        max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512))
+
         generation_kwargs = dict(
-            max_new_tokens=job_config.get("max_tokens", 512),
+            max_new_tokens=max_new_tokens,
             do_sample=False,  # always deterministic
             num_beams=job_config.get("num_beams", 10),
             length_penalty=job_config.get("length_penalty", 1.0),
@@ -532,13 +619,17 @@ def process_batch_job(
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-        # 4. Run the pipeline
+        # 4. Run the pipeline with padding/truncation controls
         logger.info(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
         results = []
         for output in text_gen_pipeline(
             prompts,
             batch_size=BATCH_JOB_PIPELINE_SIZE,
             return_full_text=False,
+            padding=True,
+            truncation=True,
+            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+            max_length=MAX_INPUT_TOKENS,
             **generation_kwargs,
         ):
             results.append(output[0]["generated_text"])
