@@ -12,8 +12,8 @@ dependencies = [
     "pydantic>=2",
     "python-dotenv",
     "safetensors",
-    "torch",            # pin per your CUDA/PyTorch stack if needed
-    "transformers>=4.45.0",  # tp_plan + modern attention impls
+    "torch",                      # pin per your CUDA/PyTorch stack if needed
+    "transformers>=4.45.0",       # tp_plan + modern attention impls
     "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "compressed-tensors",
     "tiktoken",
