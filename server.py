@@ -36,6 +36,7 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -77,16 +78,16 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
+
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
+
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
 # Constrained vocab prebuild
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
-PREBUILD_WORD_COUNTS = tuple(
-    int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
-)
+PREBUILD_WORD_COUNTS = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
 # Torch dtype
@@ -95,7 +96,6 @@ TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 # Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
-
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 
@@ -198,6 +198,7 @@ if STATIC_KV_CACHE:
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
 tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
+
 model.eval()
 
 # Ensure a pad token is set to avoid warnings/problems during generation
@@ -226,11 +227,17 @@ def tokenizer_encode_for_chat(texts: Any) -> Dict[str, torch.Tensor]:
         "truncation": True,
         "pad_to_multiple_of": PAD_TO_MULTIPLE_OF,
         "max_length": MAX_INPUT_TOKENS,
+        "return_token_type_ids": False,  # IMPORTANT: avoid passing token_type_ids to generate()
     }
-    # Conditionally disable token_type_ids for GLM-4.6-FP8 only
-    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
-        tok_kwargs["return_token_type_ids"] = False
     return tokenizer(texts, **tok_kwargs)
+
+def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """
+    Remove keys that the model/generate doesn't accept, like token_type_ids.
+    """
+    inputs = dict(inputs)
+    inputs.pop("token_type_ids", None)
+    return inputs
 
 def normalize_max_new_tokens(requested: Optional[int]) -> int:
     """
@@ -291,6 +298,7 @@ def normalizeword(w: str) -> str:
 
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
+
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
@@ -372,14 +380,18 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
+
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
+
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     stop_ids = set(get_stop_ids(tokenizer))
+
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
+
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested) — do on rank 0 only
@@ -478,6 +490,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role == "system":
             system_prompt = msg.content
             break
+
     messages = []
     if system_prompt != "":
         messages.append({"role": "system", "content": system_prompt})
@@ -494,7 +507,10 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
+    # Drop keys not accepted by model.generate()
+    inputs = strip_unused_model_inputs(inputs)
     inputs = move_inputs_to_correct_device(inputs, model)
+
     input_len = inputs["input_ids"].shape[1]
 
     prefix_fn = None
@@ -505,6 +521,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
+
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -520,11 +537,12 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
-    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
+    text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
     created = int(time.time())
+
     resp = {
         "id": f"chatcmpl-{uuid.uuid4()}",
         "object": "chat.completion",
@@ -576,20 +594,24 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
+
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
+
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
+
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 if MODEL_NAME == "zai-org/GLM-4.6-FP8":
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
+
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
             except ValidationError as e:
@@ -603,7 +625,6 @@ def process_batch_job(
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
         max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512))
-
         generation_kwargs = dict(
             max_new_tokens=max_new_tokens,
             do_sample=False,  # deterministic
@@ -635,7 +656,8 @@ def process_batch_job(
             padding=True,
             truncation=True,
             pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-            max_length=MAX_INPUT_TOKENS,
+            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length
+            return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
             **generation_kwargs,
         ):
             results.append(output[0]["generated_text"])
@@ -697,6 +719,7 @@ def create_batch_job(
     job_id = str(uuid.uuid4())
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
+
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
@@ -748,6 +771,7 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
