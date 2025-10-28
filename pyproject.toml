@@ -18,6 +18,7 @@ dependencies = [
     "compressed-tensors",
     "tiktoken",
     "sentencepiece",
+    "uvicorn>=0.30.0",            # ensure available for torchrun TP launcher
 ]
 
 [dependency-groups]
