@@ -1,3 +1,7 @@
+mkdir -p /workspace/versions && cd /workspace/versions
+git clone -b 20251025 https://github.com/monosabbath/wordlist-generation-public.git
+cd wordlist-generation-public
+
 chmod +x setup.sh
 ./setup.sh
 
