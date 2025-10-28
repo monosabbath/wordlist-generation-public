@@ -1,7 +1,16 @@
 chmod +x setup.sh
 ./setup.sh
 
-uv run uvicorn server:app --host 0.0.0.0 --port 8010
+How to run
+- Device map (single process; default uvicorn workers=1):
+  - Set PARALLEL_MODE=device_map in .env
+  - Start: uv run uvicorn server:app --host 0.0.0.0 --port 8010
+  - uvicorn defaults to a single worker unless you pass --workers.
+
+- Tensor parallel (multi-GPU, multi-process):
+  - Keep PARALLEL_MODE=tp in .env
+  - Start: torchrun --standalone --nproc-per-node=6 --master-port=29500 python tp_launcher.py
+  - Rank 0 serves the API on 0.0.0.0:8010 with workers=1 (set explicitly). Other ranks participate in TP compute and don’t bind sockets.
 
 # This job will use num_beams=4 AND the Spanish vocab with 1000 words
 curl -X POST "http://127.0.0.1:8000/v1/batch/jobs?token=my-secret-token-structured-generation&num_beams=4&vocab_lang=es&vocab_n_words=1000" \
