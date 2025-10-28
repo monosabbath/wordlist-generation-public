@@ -6,10 +6,12 @@ import tempfile
 import unicodedata
 import re
 import logging
+import datetime
 from functools import cache
 from typing import Optional, Dict, Any, List
 
 import torch
+import torch.distributed as dist
 from fastapi import (
     Depends,
     FastAPI,
@@ -52,11 +54,17 @@ app = FastAPI()
 # Config via environment
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "zai-org/GLM-4.6")
-# PARALLEL_MODE: "tp" or "device_map"
+
+# Choose how to place model across GPUs
+# - tp: tensor parallel with tp_plan='auto' (requires torch.distributed)
+# - device_map: HF device_map path (single Python process)
 PARALLEL_MODE = os.getenv("PARALLEL_MODE", "device_map").strip().lower()
 if PARALLEL_MODE not in ("tp", "device_map"):
     logger.warning(f"Invalid PARALLEL_MODE={PARALLEL_MODE}, defaulting to 'device_map'")
     PARALLEL_MODE = "device_map"
+
+# If TP is requested but distributed env is not ready, optionally fall back
+TP_FALLBACK_TO_DEVICE_MAP = os.getenv("TP_FALLBACK_TO_DEVICE_MAP", "true").lower() == "true"
 
 DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used only when PARALLEL_MODE=device_map
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
@@ -79,7 +87,6 @@ PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(
     int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
 )
-# Optional: languages to prebuild, comma-separated. If empty, skip prebuild.
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
 # Torch dtype
@@ -93,36 +100,69 @@ logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 
 # -----------------------
+# Distributed helpers
+# -----------------------
+def _ddp_env_ready():
+    return all(k in os.environ for k in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"))
+
+def is_rank0() -> bool:
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return dist.get_rank() == 0
+    except Exception:
+        pass
+    return True
+
+# -----------------------
 # Model / tokenizer load
 # -----------------------
-# Determine torch_dtype from environment variable
+# Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
-    logger.info("Using torch_dtype: bfloat16")
+    logger.info("Using dtype: bfloat16")
 elif TORCH_DTYPE_STR.lower() in ("fp16", "float16", "torch.float16"):
     TORCH_DTYPE = torch.float16
-    logger.info("Using torch_dtype: float16")
+    logger.info("Using dtype: float16")
 else:
     TORCH_DTYPE = "auto"
-    logger.info("Using torch_dtype: auto")
+    logger.info("Using dtype: auto")
 
-# Prepare model init kwargs per PARALLEL_MODE
+# Detect if distributed is ready for TP
+USE_TP = PARALLEL_MODE == "tp"
+if USE_TP:
+    ddp_ready = dist.is_available() and (dist.is_initialized() or _ddp_env_ready())
+    if not ddp_ready:
+        msg = "PARALLEL_MODE=tp requested but torch.distributed is not initialized and env vars (RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT) are missing."
+        if TP_FALLBACK_TO_DEVICE_MAP:
+            logger.warning(msg + " Falling back to PARALLEL_MODE=device_map for this run.")
+            USE_TP = False
+            PARALLEL_MODE = "device_map"
+        else:
+            raise OSError(
+                msg + " Start with torchrun, e.g.: "
+                "torchrun --standalone --nproc-per-node=6 --master-port=29500 python tp_launcher.py"
+            )
+    elif not dist.is_initialized():
+        # Initialize process group if env is present but not yet initialized
+        logger.info("Initializing torch.distributed process group for TP...")
+        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=2))
+
+# Prepare model init kwargs per mode
 model_init_kwargs: Dict[str, Any] = {
     "trust_remote_code": TRUST_REMOTE_CODE,
-    "torch_dtype": TORCH_DTYPE,
 }
-if PARALLEL_MODE == "tp":
-    # Tensor Parallel mode path
+# Use new 'dtype' param to avoid deprecation warnings if not "auto"
+if TORCH_DTYPE != "auto":
+    model_init_kwargs["dtype"] = TORCH_DTYPE
+
+if USE_TP:
     model_init_kwargs["tp_plan"] = "auto"
     logger.info("Loading model in Tensor Parallel (tp_plan='auto') mode")
 else:
-    # device_map path
     model_init_kwargs["device_map"] = DEVICE_MAP
     logger.info(f"Loading model with device_map='{DEVICE_MAP}'")
 
-# Attention impl preference
 attn_impl = ATTN_IMPLEMENTATION
-
 logger.info(
     f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}')..."
 )
@@ -178,7 +218,6 @@ def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], m):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return {k: v.to(device) for k, v in inputs.items()}
 
-
 def tokenizer_encode_for_chat(texts: Any) -> Dict[str, torch.Tensor]:
     # texts can be str or List[str]
     tok_kwargs: Dict[str, Any] = {
@@ -193,7 +232,6 @@ def tokenizer_encode_for_chat(texts: Any) -> Dict[str, torch.Tensor]:
         tok_kwargs["return_token_type_ids"] = False
     return tokenizer(texts, **tok_kwargs)
 
-
 def normalize_max_new_tokens(requested: Optional[int]) -> int:
     """
     Cap to 512 and round up to the nearest allowed value to stabilize shapes.
@@ -203,12 +241,10 @@ def normalize_max_new_tokens(requested: Optional[int]) -> int:
         return min(int(requested) if requested else 512, 512)
     target = int(requested) if requested is not None else 512
     target = min(target, 512)
-    # round up to the next allowed value >= target
     for a in ALLOWED_MAX_NEW_TOKENS:
         if target <= a:
             return a
     return ALLOWED_MAX_NEW_TOKENS[-1]
-
 
 # -----------------------
 # Create the generation pipeline
@@ -245,25 +281,20 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
                 stop_ids.append(eid)
         except Exception:
             pass
-    # Unique
     return list(set(stop_ids))
 
 # -----------------------
 # Regex-constrained vocab (lowercase-only, trie-based)
 # -----------------------
 def normalizeword(w: str) -> str:
-    # Normalize Unicode and keep accents; enforce lowercase
     return unicodedata.normalize("NFC", w.strip()).lower()
-
 
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
-
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
         self.min_rank: int = 10**12
-
 
 def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
     root = _TrieNode()
@@ -278,21 +309,16 @@ def buildtrie_with_ranks(words: List[str]) -> _TrieNode:
         node.end = True
     return root
 
-
 def escapefor_regex(ch: str) -> str:
     return re.escape(ch)
 
-
 def trieto_regex(node: _TrieNode, nlimit: int) -> str:
-    # Returns a regex for all suffixes from this node, pruned by n_limit.
     alts = []
-    # Deterministic order for stable patterns
     for ch, child in sorted(node.children.items()):
         if child.min_rank > nlimit:
             continue
         sub = trieto_regex(child, nlimit)
         alts.append(escapefor_regex(ch) + sub)
-    # If this node can terminate a word within the n_limit, allow empty suffix.
     if node.end and node.min_rank <= nlimit:
         alts.append("")
     if not alts:
@@ -301,14 +327,10 @@ def trieto_regex(node: _TrieNode, nlimit: int) -> str:
         return alts[0]
     return "(?:" + "|".join(alts) + ")"
 
-
 TRIECACHE: Dict[str, Dict[str, Any]] = {}
 
-
 def _safe_lang_name(lang: str) -> bool:
-    # Prevent path traversal; only allow simple alphanum, underscore, dash
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", lang))
-
 
 def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     if not _safe_lang_name(lang):
@@ -328,10 +350,8 @@ def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
     if not words:
         return None
     trie = buildtrie_with_ranks(words)
-    # Store only the trie to reduce memory footprint
     TRIECACHE[lang] = {"trie": trie}
     return TRIECACHE[lang]
-
 
 def buildword_regex_for_n(lang: str, n_words: int) -> Optional[str]:
     data = getor_build_trie(lang)
@@ -341,7 +361,6 @@ def buildword_regex_for_n(lang: str, n_words: int) -> Optional[str]:
     if trie.min_rank > n_words:
         return None
     return trieto_regex(trie, nlimit=n_words)
-
 
 @cache
 def build_regexp_prefix_fn(lang: str, n_words: int):
@@ -353,26 +372,20 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-    # Punctuation between words; includes spaces/newlines and common punctuation
     punct_regex = r'[.,!?¿¡…\s]+'
-    # Full-string grammar (not anchored, per user preference)
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     stop_ids = set(get_stop_ids(tokenizer))
-
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
-        # Ensure EOS is always allowed
         return list(allowed | stop_ids)
-
     return wrapped_prefix_fn
 
-
-# Startup prebuilds (if requested)
-if PREBUILD_PREFIX:
+# Startup prebuilds (if requested) — do on rank 0 only
+if PREBUILD_PREFIX and is_rank0():
     if PREBUILD_LANGS:
-        logger.info("Prebuilding prefix functions...")
+        logger.info("Prebuilding prefix functions (rank 0 only)...")
         for lang in PREBUILD_LANGS:
             if not _safe_lang_name(lang):
                 logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
@@ -414,8 +427,8 @@ def getgen_kwargs(
 ):
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        do_sample=False,                 # always deterministic
-        num_beams=int(num_beams or 10),  # default to 10 beams (can be overridden)
+        do_sample=False,                 # deterministic
+        num_beams=int(num_beams or 10),  # override via request
         length_penalty=float(length_penalty),
     )
     if prefix_fn:
@@ -472,10 +485,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
-    template_kwargs = {
-        "tokenize": False,
-        "add_generation_prompt": True
-    }
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     if MODEL_NAME == "zai-org/GLM-4.6-FP8":
         logger.info("Applying 'enable_thinking: False' for GLM-4.6-FP8.")
         template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
@@ -484,8 +494,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
-
-    # Always move inputs onto the model's main device to avoid device mismatch warnings
     inputs = move_inputs_to_correct_device(inputs, model)
     input_len = inputs["input_ids"].shape[1]
 
@@ -568,7 +576,6 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-                # Only use system prompt provided in API request
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
@@ -595,12 +602,11 @@ def process_batch_job(
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
-        # Normalize max tokens per our policy
         max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512))
 
         generation_kwargs = dict(
             max_new_tokens=max_new_tokens,
-            do_sample=False,  # always deterministic
+            do_sample=False,  # deterministic
             num_beams=job_config.get("num_beams", 10),
             length_penalty=job_config.get("length_penalty", 1.0),
             eos_token_id=stop_ids,
@@ -669,7 +675,6 @@ def process_batch_job(
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
     finally:
-        # Cleanup input file to save space
         try:
             if os.path.exists(input_path):
                 os.remove(input_path)
@@ -692,15 +697,12 @@ def create_batch_job(
     job_id = str(uuid.uuid4())
     input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
-
-    # 1. Save the uploaded file
     try:
         with open(input_path, "wb") as f:
             f.write(file.file.read())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save input file: {e}")
 
-    # 2. Store job config
     job_config = {
         "max_tokens": max_tokens,
         "num_beams": num_beams,
@@ -709,7 +711,6 @@ def create_batch_job(
         "vocab_n_words": vocab_n_words,
     }
 
-    # 3. Register the job
     JOB_STATUS[job_id] = {
         "status": "pending",
         "input_path": input_path,
@@ -718,12 +719,10 @@ def create_batch_job(
         "config": job_config,
     }
 
-    # 4. Schedule the background task
     background_tasks.add_task(
         process_batch_job, job_id, input_path, output_path, job_config
     )
 
-    # 5. Return 202 Accepted immediately
     return {
         "job_id": job_id,
         "status": "pending",
