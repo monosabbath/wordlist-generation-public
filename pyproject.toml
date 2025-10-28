@@ -3,7 +3,7 @@ name = "wordlist-generation"
 version = "0.1.0"
 description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
-requires-python = ">=3.12, <3.14"
+requires-python = ">=3.11, <3.14"
 dependencies = [
     "accelerate>=0.32.0",
     "fastapi[standard]",
