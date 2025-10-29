@@ -38,7 +38,6 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
-
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -82,12 +81,16 @@ MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
+
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
 # Constrained vocab prebuild
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
+
+# Control auto-start of TP worker loop in this module (Option A default: disabled)
+AUTO_TP_WORKER = os.getenv("AUTO_TP_WORKER", "false").lower() == "true"
 
 # Torch dtype
 TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
@@ -120,6 +123,7 @@ def is_rank0() -> bool:
 # -----------------------
 # Model / tokenizer load
 # -----------------------
+
 # Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
@@ -426,18 +430,14 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
-
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -446,20 +446,36 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
 
     return wrapped_prefix_fn
 
-# Startup prebuilds (if requested) — do on rank 0 only
-if PREBUILD_PREFIX and is_rank0():
+# Startup prebuilds (if requested)
+# - In TP mode: prebuild on ALL ranks (to avoid first-request rebuild).
+# - In device_map: prebuild once on rank 0 only.
+if PREBUILD_PREFIX:
     if PREBUILD_LANGS:
-        logger.info("Prebuilding prefix functions (rank 0 only)...")
-        for lang in PREBUILD_LANGS:
-            if not _safe_lang_name(lang):
-                logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
-                continue
-            for n_words in PREBUILD_WORD_COUNTS:
-                try:
-                    build_regexp_prefix_fn(lang, n_words)
-                except Exception as e:
-                    logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
-        logger.info("Prebuild done.")
+        if USE_TP:
+            logger.info("Prebuilding prefix functions (all TP ranks)...")
+            for lang in PREBUILD_LANGS:
+                if not _safe_lang_name(lang):
+                    logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
+                    continue
+                for n_words in PREBUILD_WORD_COUNTS:
+                    try:
+                        build_regexp_prefix_fn(lang, n_words)
+                    except Exception as e:
+                        logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
+            logger.info("Prebuild done.")
+        else:
+            if is_rank0():
+                logger.info("Prebuilding prefix functions (single process/device_map)...")
+                for lang in PREBUILD_LANGS:
+                    if not _safe_lang_name(lang):
+                        logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
+                        continue
+                    for n_words in PREBUILD_WORD_COUNTS:
+                        try:
+                            build_regexp_prefix_fn(lang, n_words)
+                        except Exception as e:
+                            logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
+                logger.info("Prebuild done.")
     else:
         logger.info("PREBUILD_PREFIX is enabled but PREBUILD_LANGS is empty; skipping prebuild.")
 
@@ -535,10 +551,12 @@ def tp_worker_loop():
 
     device = next(model.parameters()).device
     logger.info(f"[TP Worker] Rank {dist.get_rank()} entering worker loop on device {device}")
+
     while True:
         payload = _recv_obj_on_worker()
         if not payload:
             continue
+
         cmd = payload.get("cmd", "RUN")
         if cmd == "STOP":
             logger.info(f"[TP Worker] Rank {dist.get_rank()} stopping worker loop.")
@@ -569,9 +587,11 @@ def tp_worker_loop():
         # Ensure rank 0 doesn't return before all workers finish
         dist.barrier()
 
-def tp_generate_on_rank0(inputs: Dict[str, torch.Tensor],
-                         gen_kwargs: Dict[str, Any],
-                         prefix_info: Optional[Dict[str, Any]] = None):
+def tp_generate_on_rank0(
+    inputs: Dict[str, torch.Tensor],
+    gen_kwargs: Dict[str, Any],
+    prefix_info: Optional[Dict[str, Any]] = None
+):
     """
     Rank 0 path: broadcast request to workers, run local generate, wait barrier, return outputs.
     """
@@ -580,7 +600,6 @@ def tp_generate_on_rank0(inputs: Dict[str, torch.Tensor],
 
     # Strip non-serializable entries (e.g., functions) from gen_kwargs
     safe_gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "prefix_allowed_tokens_fn"}
-
     payload = {
         "cmd": "RUN",
         "inputs": {k: v.cpu().tolist() for k, v in inputs.items()},
@@ -603,9 +622,10 @@ def tp_generate_on_rank0(inputs: Dict[str, torch.Tensor],
     dist.barrier()
     return out
 
-# If this module is imported on non-rank0 TP workers, auto-start the worker loop in a daemon thread.
+# Option A: DO NOT auto-start the worker in a background thread by default.
+# Leave control to tp_launcher.py (AUTO_TP_WORKER default false).
 try:
-    if USE_TP and dist.is_available() and dist.is_initialized() and not is_rank0():
+    if AUTO_TP_WORKER and USE_TP and dist.is_available() and dist.is_initialized() and not is_rank0():
         threading.Thread(target=tp_worker_loop, daemon=True).start()
         logger.info("[TP Worker] Background worker loop thread started.")
 except Exception as e:
@@ -665,11 +685,9 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
-
     # Drop keys not accepted by model.generate()
     inputs = strip_unused_model_inputs(inputs)
     inputs = move_inputs_to_correct_device(inputs, model)
-
     input_len = inputs["input_ids"].shape[1]
 
     # Build constrained prefix function (validate early); we won't ship the callable over dist
@@ -762,24 +780,20 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
-
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 if MODEL_NAME.startswith("zai-org/GLM-4.6"):
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 prompts.append(text)
             except ValidationError as e:
@@ -827,6 +841,7 @@ def process_batch_job(
                 inputs = tokenizer_encode_for_chat(text)
                 inputs = strip_unused_model_inputs(inputs)
                 inputs = move_inputs_to_correct_device(inputs, model)
+
                 # Remove the callable before broadcast; it will be rebuilt inside tp_generate_on_rank0
                 gk = {k: v for k, v in generation_kwargs.items() if k != "prefix_allowed_tokens_fn"}
                 outputs = tp_generate_on_rank0(inputs, gk, prefix_info=prefix_info)
@@ -877,12 +892,10 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
-
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
-
     finally:
         try:
             if os.path.exists(input_path):
@@ -904,7 +917,7 @@ def create_batch_job(
     vocab_n_words: Optional[int] = None,
 ):
     job_id = str(uuid.uuid4())
-    input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
+    input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json"})
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
 
     try:
