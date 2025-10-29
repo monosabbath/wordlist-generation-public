@@ -324,7 +324,8 @@ logger.info("Pipeline created.")
 # Helpers for stop tokens
 # -----------------------
 @cache
-def get_stop_ids(tok: AutoTokenizer) -> List[int]:
+def get_stop_ids() -> List[int]:
+    tok = tokenizer
     stop_ids: List[int] = []
     if tok.eos_token_id is not None:
         if isinstance(tok.eos_token_id, int):
@@ -438,7 +439,7 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-    stop_ids = set(get_stop_ids(tokenizer))
+    stop_ids = set(get_stop_ids())
 
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
@@ -698,7 +699,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
             raise HTTPException(status_code=500, detail=f"Constrained vocabulary configuration failed for language '{req.vocab_lang}'.")
 
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
-    stop_ids = get_stop_ids(tokenizer)
+    stop_ids = get_stop_ids()
 
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
@@ -802,7 +803,7 @@ def process_batch_job(
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Error processing. {e}")
 
         # 3. Prepare shared generation kwargs for the entire batch job
-        stop_ids = get_stop_ids(tokenizer)
+        stop_ids = get_stop_ids()
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
@@ -917,7 +918,7 @@ def create_batch_job(
     vocab_n_words: Optional[int] = None,
 ):
     job_id = str(uuid.uuid4())
-    input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json"})
+    input_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
     output_path = os.path.join(BATCH_JOB_TEMP_DIR, f"{job_id}_output.json")
 
     try:
