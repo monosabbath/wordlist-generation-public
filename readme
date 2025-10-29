@@ -1,14 +1,3 @@
-Docker Build
-docker build \
-  --build-arg MODEL_NAME=zai-org/GLM-4.6 \
-  --build-arg TRUST_REMOTE_CODE=true \
-  --build-arg HF_TOKEN=YOUR_HF_TOKEN_IF_NEEDED \
-  -t johnsnow252/wordlist-generation:glm46 .
-
-docker run --gpus all --rm -p 8010:8010 \
-  -e SECRET_TOKEN=changeme \
-  -e PARALLEL_MODE=tp \
-  johnsnow252/wordlist-generation:glm46
 
 Terminal Runs
 mkdir -p /workspace/versions && cd /workspace/versions
@@ -30,6 +19,8 @@ How to run
   - Start: uv run torchrun --standalone --nproc-per-node=6 --master-port=29500 tp_launcher.py
   - Rank 0 serves the API on 0.0.0.0:8010 with workers=1 (set explicitly). Other ranks participate in TP compute and don’t bind sockets.
 
+
+Batching
 # This job will use num_beams=4 AND the Spanish vocab with 1000 words
 curl -X POST "http://127.0.0.1:8000/v1/batch/jobs?token=my-secret-token-structured-generation&num_beams=4&vocab_lang=es&vocab_n_words=1000" \
      -F "file=@/path/to/your/requests.json"
