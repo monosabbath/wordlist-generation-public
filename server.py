@@ -499,8 +499,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
             messages.append({"role": msg.role, "content": msg.content})
 
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if MODEL_NAME == "zai-org/GLM-4.6-FP8":
-        logger.info("Applying 'enable_thinking: False' for GLM-4.6-FP8.")
+    if MODEL_NAME.startswith("zai-org/GLM-4.6"):
+        logger.info("Applying 'enable_thinking: False' for GLM-4.6.")
         template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
 
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -609,7 +609,7 @@ def process_batch_job(
                         messages.append({"role": msg.role, "content": msg.content})
 
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-                if MODEL_NAME == "zai-org/GLM-4.6-FP8":
+                if MODEL_NAME.startswith("zai-org/GLM-4.6"):
                     template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
 
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
