@@ -13,14 +13,15 @@ RUN pip install --no-cache-dir uv
 WORKDIR /app
 # Copy only project metadata first to leverage Docker layer caching during installs
 COPY pyproject.toml .
-COPY README.md .
 # Copy the rest of the repo
-COPY . .
+COPY es.txt .
+COPY server.py .
+COPY tp_launcher.py .
 
 # Ensure .env is present inside the image (you can overwrite at runtime)
 # If you plan to supply .env at runtime via RunPod env UI, this is optional.
 # Otherwise, copy your local .env:
-# COPY .env /app/.env
+COPY .env /app/.env
 
 # Create the virtual environment and install project dependencies [5][2]
 RUN uv venv && \
