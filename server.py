@@ -7,12 +7,12 @@ import unicodedata
 import re
 import logging
 import datetime
+import threading
 from functools import cache
 from typing import Optional, Dict, Any, List
 
 import torch
 import torch.distributed as dist
-
 from fastapi import (
     Depends,
     FastAPI,
@@ -26,7 +26,6 @@ from fastapi import (
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
-
 from huggingface_hub import snapshot_download
 
 # Load environment as early as possible
@@ -39,6 +38,7 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -82,7 +82,6 @@ MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
-
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
 # Constrained vocab prebuild
@@ -121,7 +120,6 @@ def is_rank0() -> bool:
 # -----------------------
 # Model / tokenizer load
 # -----------------------
-
 # Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
@@ -329,7 +327,6 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
-
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -399,21 +396,17 @@ def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
         return None
     if lang in TRIECACHE:
         return TRIECACHE[lang]
-
     filename = f"{lang}.txt"
     if not os.path.exists(filename):
         return None
-
     try:
         with open(filename, encoding="utf-8") as fin:
             words = [normalizeword(w) for w in fin if w.strip()]
     except Exception as e:
         logger.error(f"Error reading language file {filename}: {e}")
         return None
-
     if not words:
         return None
-
     trie = buildtrie_with_ranks(words)
     TRIECACHE[lang] = {"trie": trie}
     return TRIECACHE[lang]
@@ -441,6 +434,7 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
 
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
+
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
 
@@ -512,6 +506,112 @@ def getgen_kwargs(
     return gen_kwargs
 
 # -----------------------
+# TP helpers (broadcast + worker loop)
+# -----------------------
+def _broadcast_obj_from_rank0(obj: Any):
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError("Distributed not initialized for TP broadcast")
+    buf = [obj]
+    dist.broadcast_object_list(buf, src=0)
+
+def _recv_obj_on_worker() -> Any:
+    buf = [None]
+    dist.broadcast_object_list(buf, src=0)
+    return buf[0]
+
+def tp_worker_loop():
+    """
+    Non-rank0 processes wait for broadcast requests and run model.generate()
+    in lockstep with rank 0. This enables Tensor Parallel inference from an
+    HTTP server that runs on rank 0 only.
+    """
+    try:
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+        if is_rank0():
+            return
+    except Exception:
+        return
+
+    device = next(model.parameters()).device
+    logger.info(f"[TP Worker] Rank {dist.get_rank()} entering worker loop on device {device}")
+    while True:
+        payload = _recv_obj_on_worker()
+        if not payload:
+            continue
+        cmd = payload.get("cmd", "RUN")
+        if cmd == "STOP":
+            logger.info(f"[TP Worker] Rank {dist.get_rank()} stopping worker loop.")
+            break
+        if cmd != "RUN":
+            continue
+
+        # Rebuild inputs on this worker
+        inputs_obj = payload["inputs"]
+        local_inputs = {}
+        for k, v in inputs_obj.items():
+            # input_ids / attention_mask are integer tensors
+            local_inputs[k] = torch.tensor(v, dtype=torch.long, device=device)
+
+        # Rebuild generation kwargs
+        gen_kwargs = dict(payload["gen_kwargs"])
+
+        # Rebuild prefix fn (can't broadcast callables)
+        prefix = payload.get("prefix")
+        if prefix and prefix.get("lang") and prefix.get("n"):
+            pf = build_regexp_prefix_fn(prefix["lang"], int(prefix["n"]))
+            if pf:
+                gen_kwargs["prefix_allowed_tokens_fn"] = pf
+
+        with torch.inference_mode():
+            _ = model.generate(**local_inputs, **gen_kwargs)
+
+        # Ensure rank 0 doesn't return before all workers finish
+        dist.barrier()
+
+def tp_generate_on_rank0(inputs: Dict[str, torch.Tensor],
+                         gen_kwargs: Dict[str, Any],
+                         prefix_info: Optional[Dict[str, Any]] = None):
+    """
+    Rank 0 path: broadcast request to workers, run local generate, wait barrier, return outputs.
+    """
+    if not (dist.is_available() and dist.is_initialized() and is_rank0()):
+        raise RuntimeError("tp_generate_on_rank0 called without distributed rank 0 ready")
+
+    # Strip non-serializable entries (e.g., functions) from gen_kwargs
+    safe_gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "prefix_allowed_tokens_fn"}
+
+    payload = {
+        "cmd": "RUN",
+        "inputs": {k: v.cpu().tolist() for k, v in inputs.items()},
+        "gen_kwargs": safe_gen_kwargs,
+        "prefix": prefix_info if prefix_info and prefix_info.get("lang") and prefix_info.get("n") else None,
+    }
+    _broadcast_obj_from_rank0(payload)
+
+    # Re-add the prefix function locally if needed
+    local_gen_kwargs = dict(safe_gen_kwargs)
+    if prefix_info and prefix_info.get("lang") and prefix_info.get("n"):
+        pf = build_regexp_prefix_fn(prefix_info["lang"], int(prefix_info["n"]))
+        if pf:
+            local_gen_kwargs["prefix_allowed_tokens_fn"] = pf
+
+    with torch.inference_mode():
+        out = model.generate(**inputs, **local_gen_kwargs)
+
+    # Wait for all workers
+    dist.barrier()
+    return out
+
+# If this module is imported on non-rank0 TP workers, auto-start the worker loop in a daemon thread.
+try:
+    if USE_TP and dist.is_available() and dist.is_initialized() and not is_rank0():
+        threading.Thread(target=tp_worker_loop, daemon=True).start()
+        logger.info("[TP Worker] Background worker loop thread started.")
+except Exception as e:
+    logger.warning(f"Could not start TP worker loop automatically: {e}")
+
+# -----------------------
 # OpenAI-compatible API
 # -----------------------
 class ChatMessage(BaseModel):
@@ -568,11 +668,11 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Drop keys not accepted by model.generate()
     inputs = strip_unused_model_inputs(inputs)
-
     inputs = move_inputs_to_correct_device(inputs, model)
 
     input_len = inputs["input_ids"].shape[1]
 
+    # Build constrained prefix function (validate early); we won't ship the callable over dist
     prefix_fn = None
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
@@ -590,8 +690,16 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         prefix_fn=prefix_fn
     )
 
-    with torch.inference_mode():
-        outputs = model.generate(**inputs, **gen_kwargs)
+    # In TP mode: broadcast request and run generate on all ranks
+    use_tp_generate = USE_TP and dist.is_available() and dist.is_initialized() and is_rank0()
+    if use_tp_generate:
+        prefix_info = None
+        if req.vocab_lang and req.vocab_n_words:
+            prefix_info = {"lang": req.vocab_lang, "n": int(req.vocab_n_words)}
+        outputs = tp_generate_on_rank0(inputs, gen_kwargs, prefix_info=prefix_info)
+    else:
+        with torch.inference_mode():
+            outputs = model.generate(**inputs, **gen_kwargs)
 
     # Determine finish reason
     gen_len = int(outputs[0].shape[0] - input_len)
@@ -599,10 +707,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
 
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
-
     created = int(time.time())
 
     resp = {
@@ -699,30 +805,47 @@ def process_batch_job(
         # Build prefix function if vocab is constrained
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
+        prefix_info = None
         if vocab_lang and vocab_n_words:
             logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
-            prefix_fn = build_regexp_prefix_fn(vocab_lang, vocab_n_words)
-            if prefix_fn:
-                generation_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
+            pf = build_regexp_prefix_fn(vocab_lang, vocab_n_words)
+            if pf:
+                generation_kwargs["prefix_allowed_tokens_fn"] = pf
+                prefix_info = {"lang": vocab_lang, "n": int(vocab_n_words)}
                 logger.info(f"[Job {job_id}] Successfully added prefix function.")
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-        # 4. Run the pipeline with padding/truncation controls
-        logger.info(f"[Job {job_id}] Running pipeline (Batch Size: {BATCH_JOB_PIPELINE_SIZE})...")
-        results = []
-        for output in text_gen_pipeline(
-            prompts,
-            batch_size=BATCH_JOB_PIPELINE_SIZE,
-            return_full_text=False,
-            padding=True,
-            truncation=True,
-            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length
-            return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
-            **generation_kwargs,
-        ):
-            results.append(output[0]["generated_text"])
+        # 4. Run generation
+        logger.info(f"[Job {job_id}] Running generation...")
+        results: List[str] = []
+
+        use_tp_generate = USE_TP and dist.is_available() and dist.is_initialized() and is_rank0()
+        if use_tp_generate:
+            # Run prompts one by one in TP mode
+            for text in prompts:
+                inputs = tokenizer_encode_for_chat(text)
+                inputs = strip_unused_model_inputs(inputs)
+                inputs = move_inputs_to_correct_device(inputs, model)
+                # Remove the callable before broadcast; it will be rebuilt inside tp_generate_on_rank0
+                gk = {k: v for k, v in generation_kwargs.items() if k != "prefix_allowed_tokens_fn"}
+                outputs = tp_generate_on_rank0(inputs, gk, prefix_info=prefix_info)
+                input_len = inputs["input_ids"].shape[1]
+                results.append(tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True))
+        else:
+            # Use HF pipeline path in single-process mode for throughput
+            for output in text_gen_pipeline(
+                prompts,
+                batch_size=BATCH_JOB_PIPELINE_SIZE,
+                return_full_text=False,
+                padding=True,
+                truncation=True,
+                pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+                max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length
+                return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
+                **generation_kwargs,
+            ):
+                results.append(output[0]["generated_text"])
 
         # 5. Format and save the output file
         logger.info(f"[Job {job_id}] Formatting and saving results...")
@@ -754,10 +877,12 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
+
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
+
     finally:
         try:
             if os.path.exists(input_path):
@@ -833,7 +958,6 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
