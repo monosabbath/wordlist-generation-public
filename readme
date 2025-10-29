@@ -3,12 +3,12 @@ docker build \
   --build-arg MODEL_NAME=zai-org/GLM-4.6 \
   --build-arg TRUST_REMOTE_CODE=true \
   --build-arg HF_TOKEN=YOUR_HF_TOKEN_IF_NEEDED \
-  -t your-registry/wordlist-generation:glm46 .
+  -t johnsnow252/wordlist-generation:glm46 .
 
 docker run --gpus all --rm -p 8010:8010 \
   -e SECRET_TOKEN=changeme \
   -e PARALLEL_MODE=tp \
-  your-registry/wordlist-generation:glm46
+  johnsnow252/wordlist-generation:glm46
 
 Terminal Runs
 mkdir -p /workspace/versions && cd /workspace/versions
