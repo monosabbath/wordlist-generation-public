@@ -16,7 +16,7 @@ How to run
 
 - Tensor parallel (multi-GPU, multi-process):
   - Keep PARALLEL_MODE=tp in .env
-  - Start: uv run torchrun --standalone --nproc-per-node=6 --master-port=29500 tp_launcher.py
+  - Start: uv run torchrun --standalone --nproc-per-node=8 --master-port=29500 tp_launcher.py
   - Rank 0 serves the API on 0.0.0.0:8010 with workers=1 (set explicitly). Other ranks participate in TP compute and don’t bind sockets.
 
 
