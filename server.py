@@ -12,6 +12,7 @@ from typing import Optional, Dict, Any, List
 
 import torch
 import torch.distributed as dist
+
 from fastapi import (
     Depends,
     FastAPI,
@@ -26,6 +27,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, ValidationError
 from dotenv import load_dotenv
 
+from huggingface_hub import snapshot_download
+
 # Load environment as early as possible
 load_dotenv()
 
@@ -36,7 +39,6 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
-
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -66,7 +68,6 @@ if PARALLEL_MODE not in ("tp", "device_map"):
 
 # If TP is requested but distributed env is not ready, optionally fall back
 TP_FALLBACK_TO_DEVICE_MAP = os.getenv("TP_FALLBACK_TO_DEVICE_MAP", "true").lower() == "true"
-
 DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used only when PARALLEL_MODE=device_map
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
@@ -78,7 +79,6 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
-
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
@@ -99,6 +99,11 @@ BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 
+# Local staging dir for model (rank-0 will fill this once)
+# Default uses nested path so MODEL_NAME with slashes creates a subdir tree.
+LOCAL_MODEL_DIR = os.getenv("LOCAL_MODEL_DIR", os.path.join("/local_nvme/models", MODEL_NAME))
+HF_TOKEN = os.getenv("HF_TOKEN", None)  # optional private hub token
+
 # -----------------------
 # Distributed helpers
 # -----------------------
@@ -116,6 +121,7 @@ def is_rank0() -> bool:
 # -----------------------
 # Model / tokenizer load
 # -----------------------
+
 # Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
@@ -140,7 +146,7 @@ if USE_TP:
         else:
             raise OSError(
                 msg + " Start with torchrun, e.g.: "
-                "torchrun --standalone --nproc-per-node=6 --master-port=29500 python tp_launcher.py"
+                "torchrun --standalone --nproc-per-node=6 --master-port=29500 tp_launcher.py"
             )
     elif not dist.is_initialized():
         # Initialize process group if env is present but not yet initialized
@@ -150,10 +156,12 @@ if USE_TP:
 # Prepare model init kwargs per mode
 model_init_kwargs: Dict[str, Any] = {
     "trust_remote_code": TRUST_REMOTE_CODE,
+    "low_cpu_mem_usage": True,
+    "local_files_only": True,  # important once staged
 }
 # Use new 'dtype' param to avoid deprecation warnings if not "auto"
 if TORCH_DTYPE != "auto":
-    model_init_kwargs["dtype"] = TORCH_DTYPE
+    model_init_kwargs["torch_dtype"] = TORCH_DTYPE  # prefer torch_dtype kw in new transformers
 
 if USE_TP:
     model_init_kwargs["tp_plan"] = "auto"
@@ -164,18 +172,62 @@ else:
 
 attn_impl = ATTN_IMPLEMENTATION
 logger.info(
-    f"Loading model '{MODEL_NAME}' (Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}')..."
+    f"Preparing to load model '{MODEL_NAME}' "
+    f"(Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}')..."
 )
+
+# ---------------
+# Rank-0 staging
+# ---------------
+def stage_model_locally():
+    """
+    Rank-0 downloads/snapshots the model repo into LOCAL_MODEL_DIR.
+    Other ranks wait at a barrier (if distributed is initialized).
+    After the barrier, all ranks load strictly from local disk.
+    """
+    # Make sure parent directories exist
+    os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
+
+    rank = 0
+    world_size = 1
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+    if rank == 0:
+        logger.info(f"[Staging] Snapshotting '{MODEL_NAME}' to '{LOCAL_MODEL_DIR}' (world_size={world_size})")
+        # NOTE:
+        # - local_dir_use_symlinks=False ensures a plain copy rather than symlinks
+        # - HF_HUB_ENABLE_HF_TRANSFER=1 env speeds up downloads
+        # - snapshot_download is idempotent; it won’t redownload if already present
+        snapshot_download(
+            repo_id=MODEL_NAME,
+            local_dir=LOCAL_MODEL_DIR,
+            local_dir_use_symlinks=False,
+            token=HF_TOKEN,
+        )
+        logger.info("[Staging] Snapshot complete.")
+
+    if dist.is_available() and dist.is_initialized():
+        logger.info("[Staging] Waiting at distributed barrier...")
+        dist.barrier()
+        logger.info("[Staging] Barrier complete for all ranks.")
+
+# Stage before calling any from_pretrained
+stage_model_locally()
+
+# Now load from LOCAL_MODEL_DIR only
+logger.info("Loading model from local staged directory...")
 try:
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        LOCAL_MODEL_DIR,
         attn_implementation=attn_impl,
         **model_init_kwargs,
     )
 except TypeError:
     logger.warning("Model.from_pretrained() did not accept 'attn_implementation'; loading without it.")
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
+        LOCAL_MODEL_DIR,
         **model_init_kwargs,
     )
     # Try to set after load
@@ -196,9 +248,10 @@ if STATIC_KV_CACHE:
     except Exception as e:
         logger.warning(f"Static KV cache not available: {e}")
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE)
+tokenizer = AutoTokenizer.from_pretrained(
+    LOCAL_MODEL_DIR, trust_remote_code=TRUST_REMOTE_CODE, local_files_only=True
+)
 tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
-
 model.eval()
 
 # Ensure a pad token is set to avoid warnings/problems during generation
@@ -276,6 +329,7 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
+
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -298,7 +352,6 @@ def normalizeword(w: str) -> str:
 
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
-
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
@@ -346,17 +399,21 @@ def getor_build_trie(lang: str) -> Optional[Dict[str, Any]]:
         return None
     if lang in TRIECACHE:
         return TRIECACHE[lang]
+
     filename = f"{lang}.txt"
     if not os.path.exists(filename):
         return None
+
     try:
         with open(filename, encoding="utf-8") as fin:
             words = [normalizeword(w) for w in fin if w.strip()]
     except Exception as e:
         logger.error(f"Error reading language file {filename}: {e}")
         return None
+
     if not words:
         return None
+
     trie = buildtrie_with_ranks(words)
     TRIECACHE[lang] = {"trie": trie}
     return TRIECACHE[lang]
@@ -376,6 +433,7 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
+
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
@@ -383,9 +441,9 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
 
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
+
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -507,8 +565,10 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
+
     # Drop keys not accepted by model.generate()
     inputs = strip_unused_model_inputs(inputs)
+
     inputs = move_inputs_to_correct_device(inputs, model)
 
     input_len = inputs["input_ids"].shape[1]
@@ -539,8 +599,10 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
 
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
+
     created = int(time.time())
 
     resp = {
