@@ -462,8 +462,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # For GLM-4.6 only: prefill the assistant turn with empty think tags
     if "glm-4.6" in MODEL_NAME.lower():
-        texts = texts + "
-"
+        text = text + "<think></think>"
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
