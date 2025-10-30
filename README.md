@@ -25,12 +25,12 @@ Modularized for readability and maintainability.
 4) Place any wordlists (e.g., es.txt) in the `wordlists/` directory (default). The example includes `wordlists/es.txt`.
 
 5) Run the server
-   uvicorn wordlist_generation.main:app --reload
+   uvicorn wordlist_generation.main:app --reload --host 0.0.0.0 --port 8010
 
 6) Test authentication
    - The server requires a Bearer token matching SECRET_TOKEN in your .env.
    - Example:
-     curl -H "Authorization: Bearer changeme" http://127.0.0.1:8000/v1/models
+     curl -H "Authorization: Bearer changeme" http://0.0.0.0:8010/v1/models
 
 ## Endpoints
 
