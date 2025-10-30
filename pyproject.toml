@@ -1,37 +1,30 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
+description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
+readme = "README.md"
 requires-python = ">=3.12, <3.13"
 dependencies = [
-  "accelerate>=0.32.0",
-  "fastapi[standard]",
-  "httpx",
-  "lm-format-enforcer>=0.10.0",
-  "pydantic>=2",
-  "python-dotenv",
-  "safetensors",
-  "huggingface-hub>=0.23.0",
-  "torch",  # install the correct CUDA build separately or via constraints
-  "transformers>=4.45.0",
-  "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "compressed-tensors",
-  "tiktoken",
-  "sentencepiece",
-  # fastapi[standard] already includes uvicorn; keep this only if you prefer a specific pin:
-  # "uvicorn>=0.30.0",
-  # FlashAttention (Linux/x86_64 only)
-  "flash-attn>=2.8.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "accelerate>=0.32.0",
+    "fastapi[standard]",
+    "httpx",
+    "lm-format-enforcer>=0.10.0",
+    "pydantic>=2",
+    "python-dotenv",
+    "safetensors",
+    "torch",                      # pin per your CUDA/PyTorch stack if needed
+    "transformers>=4.45.0",       # tp_plan + modern attention impls
+    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "compressed-tensors",
+    "tiktoken",
+    "sentencepiece",
+    "uvicorn>=0.30.0",            # ensure available for torchrun TP launcher
 ]
 
-[tool.uv.extra-build-dependencies]
-flash-attn = ["torch"]
-
 [dependency-groups]
-dev = ["ruff"]
+dev = [
+    "ruff",
+]
 
 [tool.setuptools]
 py-modules = ["server"]
-
-[build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
