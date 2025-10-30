@@ -61,8 +61,8 @@ Use `vocab_lang` + `vocab_n_words` to enable constrained vocabulary generation.
 - If you change `PREBUILD_LANGS` or wordlists, restart the server to rebuild prefix constraints.
 
 
-Batching
-# This job will use num_beams=4 AND the Spanish vocab with 1000 words
+# Batching
+This job will use num_beams=4 AND the Spanish vocab with 1000 words
 curl -X POST "http://127.0.0.1:8000/v1/batch/jobs?token=my-secret-token-structured-generation&num_beams=4&vocab_lang=es&vocab_n_words=1000" \
      -F "file=@/path/to/your/requests.json"
 
@@ -71,7 +71,6 @@ POST /v1/batch/jobs: You upload your JSON file (which should contain a list of C
 GET /v1/batch/jobs/{job_id}: You use this to check the status ("pending", "processing", "completed", or "failed").
 
 GET /v1/batch/jobs/{job_id}/results: Once the status is "completed", you call this to download the final JSON response file.
-
 
 Example File (my_requests.json):
 JSON
