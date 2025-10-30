@@ -2,7 +2,7 @@ bash -lc 'set -euo pipefail; mkdir -p /workspace/versions && cd /workspace/versi
 
 Terminal Runs
 mkdir -p /workspace/versions && cd /workspace/versions
-git clone -b 20251025 https://github.com/monosabbath/wordlist-generation-public.git
+git clone -b 20251030 https://github.com/monosabbath/wordlist-generation-public.git
 cd wordlist-generation-public
 cd /workspace/versions/wordlist-generation-public
 
