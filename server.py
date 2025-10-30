@@ -464,10 +464,9 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)  # [1]
 
-    # For GLM-4.6 only: prefill the assistant turn with empty think tags (Option A)
+    # For GLM-4.6 only: prefill the assistant turn with empty think tags
     if "glm-4.6" in MODEL_NAME.lower():
-        texts = texts + "
-"
+        texts = texts + "<think></think>"
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
