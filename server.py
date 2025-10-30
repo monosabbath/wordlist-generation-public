@@ -58,6 +58,7 @@ DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used for model placement
 
 # If GLM-4.6 uses custom chat templates, you may need TRUST_REMOTE_CODE=true
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
+
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 
 # Attention implementation preference
@@ -67,6 +68,7 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
+
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
@@ -233,6 +235,7 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
+
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -333,14 +336,18 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
+
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
+
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
+
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
+
     stop_ids = set(get_stop_ids(tokenizer))
 
     def wrapped_prefix_fn(batch_id, input_ids):
@@ -457,7 +464,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)  # [1]
 
-    # For GLM-4.6 only: prefill the assistant turn with empty think tags
+    # For GLM-4.6 only: prefill the assistant turn with empty think tags (Option A)
     if "glm-4.6" in MODEL_NAME.lower():
         texts = texts + "
 "
@@ -496,6 +503,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
+
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
     prompt_tokens = int(inputs["input_ids"].shape[1])
@@ -553,23 +561,29 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
+
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
+
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
+
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
+
                 # For GLM-4.6 only: prefill the assistant turn with empty think tags
                 if "glm-4.6" in MODEL_NAME.lower():
-                    texts = texts + "<think></think>"
+                    text = text + "<think></think>"
+
                 prompts.append(text)
+
             except ValidationError as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
@@ -581,6 +595,7 @@ def process_batch_job(
             tokenizer.pad_token_id = stop_ids[0] if stop_ids else tokenizer.eos_token_id
 
         max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512))
+
         generation_kwargs = dict(
             max_new_tokens=max_new_tokens,
             do_sample=False,  # deterministic
@@ -605,6 +620,7 @@ def process_batch_job(
         # 4. Run generation (single process / device_map path)
         logger.info(f"[Job {job_id}] Running generation...")
         results: List[str] = []
+
         for output in text_gen_pipeline(
             prompts,
             batch_size=BATCH_JOB_PIPELINE_SIZE,
@@ -612,8 +628,7 @@ def process_batch_job(
             padding=True,
             truncation=True,
             pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length (note: pipeline interprets this as gen max length)
-            return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
+            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length (pipeline interprets as gen max length)
             **generation_kwargs,
         ):
             results.append(output[0]["generated_text"])
@@ -648,10 +663,12 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
+
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
         JOB_STATUS[job_id]["error"] = str(e)
+
     finally:
         try:
             if os.path.exists(input_path):
@@ -727,6 +744,7 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
