@@ -568,7 +568,7 @@ def process_batch_job(
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
                 # For GLM-4.6 only: prefill the assistant turn with empty think tags
                 if "glm-4.6" in MODEL_NAME.lower():
-                    text = text + "<think></think>"
+                    texts = texts + "<think></think>"
                 prompts.append(text)
             except ValidationError as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
