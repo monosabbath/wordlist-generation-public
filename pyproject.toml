@@ -1,31 +1,25 @@
 [project]
 name = "wordlist-generation"
 version = "0.1.0"
-description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
-readme = "README.md"
 requires-python = ">=3.12, <3.13"
 dependencies = [
-    "accelerate>=0.32.0",
-    "fastapi[standard]",
-    "httpx",
-    "lm-format-enforcer>=0.10.0",
-    "pydantic>=2",
-    "python-dotenv",
-    "safetensors",
-    "torch",                      # pin per your CUDA/PyTorch stack if needed
-    "transformers>=4.45.0",       # tp_plan + modern attention impls
-    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "compressed-tensors",
-    "tiktoken",
-    "sentencepiece",
-    "uvicorn>=0.30.0",            # ensure available for torchrun TP launcher
-    "flash-attn>=2.5; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "accelerate>=0.32.0",
+  "fastapi[standard]",
+  "httpx",
+  "lm-format-enforcer>=0.10.0",
+  "pydantic>=2",
+  "python-dotenv",
+  "safetensors",
+  "torch",                      # keep your CUDA-enabled torch here
+  "transformers>=4.45.0",
+  "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "compressed-tensors",
+  "tiktoken",
+  "sentencepiece",
+  "uvicorn>=0.30.0",
+  # add flash-attn (pin to a version that has a wheel for your env)
+  "flash-attn>=2.8.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
-[dependency-groups]
-dev = [
-    "ruff",
-]
-
-[tool.setuptools]
-py-modules = ["server"]
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
