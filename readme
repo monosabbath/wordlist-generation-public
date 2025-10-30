@@ -1,4 +1,4 @@
-bash -lc 'set -euo pipefail; mkdir -p /workspace/versions && cd /workspace/versions && git clone -b 20251025 https://github.com/monosabbath/wordlist-generation-public.git && cd wordlist-generation-public && chmod +x setup.sh && ./setup.sh'
+bash -lc 'set -euo pipefail; mkdir -p /workspace/versions && cd /workspace/versions && git clone -b 20251030 https://github.com/monosabbath/wordlist-generation-public.git && cd wordlist-generation-public && chmod +x setup.sh && ./setup.sh'
 
 Terminal Runs
 mkdir -p /workspace/versions && cd /workspace/versions
@@ -9,16 +9,7 @@ cd /workspace/versions/wordlist-generation-public
 chmod +x setup.sh
 ./setup.sh
 
-How to run
-- Device map (single process; default uvicorn workers=1):
-  - Set PARALLEL_MODE=device_map in .env
-  - Start: uv run uvicorn server:app --host 0.0.0.0 --port 8010
-  - uvicorn defaults to a single worker unless you pass --workers.
-
-- Tensor parallel (multi-GPU, multi-process):
-  - Keep PARALLEL_MODE=tp in .env
-  - Start: uv run torchrun --standalone --nproc-per-node=8 --master-port=29500 tp_launcher.py
-  - Rank 0 serves the API on 0.0.0.0:8010 with workers=1 (set explicitly). Other ranks participate in TP compute and don’t bind sockets.
+uv run uvicorn server:app --host 0.0.0.0 --port 8010
 
 
 Batching
