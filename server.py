@@ -34,6 +34,7 @@ from lmformatenforcer import RegexParser
 from lmformatenforcer.integrations.transformers import (
     build_transformers_prefix_allowed_tokens_fn,
 )
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -52,27 +53,37 @@ app = FastAPI()
 # Config via environment
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "zai-org/GLM-4.6")
+
 # Device map (single process)
 DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used for model placement
-# If GLM-4.6 uses custom chat templates, you may need TRUST_REMOTE_CODE=true
+
+# If specific models use custom chat templates, you may need TRUST_REMOTE_CODE=true
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
+
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
+
 # Attention implementation preference
 ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").strip()
+
 # Padding/length controls
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
+
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
+
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
+
 # Constrained vocab prebuild
 PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
+
 # Torch dtype
 TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
+
 # Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
@@ -83,7 +94,6 @@ logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 # -----------------------
 # Model / tokenizer load
 # -----------------------
-
 # Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
@@ -102,6 +112,7 @@ model_init_kwargs: Dict[str, Any] = {
     "local_files_only": False,  # allow download into default HF cache
     "device_map": DEVICE_MAP,
 }
+
 # Use new 'dtype' param to avoid deprecation warnings if not "auto"
 if TORCH_DTYPE != "auto":
     model_init_kwargs["torch_dtype"] = TORCH_DTYPE  # prefer torch_dtype kw in new transformers
@@ -220,11 +231,15 @@ logger.info("Pipeline created.")
 @cache
 def get_stop_ids(tok: AutoTokenizer) -> List[int]:
     stop_ids: List[int] = []
+
+    # Base EOS
     if tok.eos_token_id is not None:
         if isinstance(tok.eos_token_id, int):
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
+
+    # Common end markers
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -237,7 +252,37 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
                 stop_ids.append(eid)
         except Exception:
             pass
+
+    # Cohere end markers (safe: only added if tokenizer knows them)
+    for special in ("<|END_OF_TURN_TOKEN|>", "<|END_RESPONSE|>"):
+        try:
+            eid = tok.convert_tokens_to_ids(special)
+            if eid is not None and eid != tok.unk_token_id and eid != -1:
+                stop_ids.append(eid)
+        except Exception:
+            pass
+
     return list(set(stop_ids))
+
+def get_cohere_control_ids(tok: AutoTokenizer) -> List[int]:
+    names = [
+        "<|START_OF_TURN_TOKEN|>",
+        "<|END_OF_TURN_TOKEN|>",
+        "<|CHATBOT_TOKEN|>",
+        "<|START_RESPONSE|>",
+        "<|END_RESPONSE|>",
+        "<|START_THINKING|>",
+        "<|END_THINKING|>",
+    ]
+    out: List[int] = []
+    for n in names:
+        try:
+            i = tok.convert_tokens_to_ids(n)
+            if i is not None and i != tok.unk_token_id and i != -1:
+                out.append(i)
+        except Exception:
+            pass
+    return list(set(out))
 
 # -----------------------
 # Regex-constrained vocab (lowercase-only, trie-based)
@@ -324,18 +369,25 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
+
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
+
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
+
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
     stop_ids = set(get_stop_ids(tokenizer))
+    cohere_ids = set(get_cohere_control_ids(tokenizer)) if "coherelabs/command-a-reasoning-08-2025" == MODEL_NAME.strip().lower() else set()
+
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
-        return list(allowed | stop_ids)
+        # Always allow stop + Cohere control ids so the model can open/close turns/thinking/response
+        return list(allowed | stop_ids | cohere_ids)
+
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested)
@@ -405,11 +457,48 @@ def is_cohere_reasoning_model(model_name: str) -> bool:
 
 def build_template_kwargs_for_model() -> Dict[str, Any]:
     # Base kwargs used everywhere in this server
-    kwargs: Dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
-    # For CohereLabs/command-a-reasoning-08-2025: turn reasoning off by default
+    kwargs: Dict[str, Any] = {"add_generation_prompt": True}
+
+    # For CohereLabs/command-a-reasoning-08-2025: use tokenized chat template and disable reasoning by default
     if is_cohere_reasoning_model(MODEL_NAME):
-        kwargs["reasoning"] = False
+        kwargs.update({
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+            "reasoning": False,  # set True if you want thinking spans
+        })
+    else:
+        kwargs["tokenize"] = False
+
     return kwargs
+
+def truncate_inputs_to_max_length(inputs: Dict[str, torch.Tensor], max_length: int) -> Dict[str, torch.Tensor]:
+    """
+    Left-truncate input_ids and attention_mask to max_length tokens (keeping the last max_length tokens).
+    """
+    input_ids = inputs["input_ids"]
+    attn = inputs.get("attention_mask")
+    if input_ids.dim() == 1:
+        length = input_ids.size(0)
+        if length > max_length:
+            input_ids = input_ids[-max_length:]
+            if attn is not None:
+                attn = attn[-max_length:]
+    elif input_ids.dim() == 2:
+        # batch case
+        bsz, seqlen = input_ids.size()
+        if seqlen > max_length:
+            input_ids = input_ids[:, -max_length:]
+            if attn is not None:
+                attn = attn[:, -max_length:]
+    out = {"input_ids": input_ids}
+    if attn is not None:
+        out["attention_mask"] = attn
+    # pass through any other keys unchanged
+    for k, v in inputs.items():
+        if k not in out:
+            out[k] = v
+    return out
 
 # -----------------------
 # OpenAI-compatible API
@@ -456,21 +545,27 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
-    # Build base chat template and disable reasoning for CohereLabs/command-a-reasoning-08-2025
+    # Build base chat template
     template_kwargs = build_template_kwargs_for_model()
-    texts = tokenizer.apply_chat_template(messages, **template_kwargs)  # apply_chat_template call [1]
 
-    # For GLM-4.6 only: prefill the assistant turn with empty think tags
-    if "glm-4.6" in MODEL_NAME.lower():
-        text = text + "<think></think>"
-
-    # Tokenize with left padding, truncation, pad_to_multiple_of
-    inputs = tokenizer_encode_for_chat(texts)
-    # Drop keys not accepted by model.generate()
-    inputs = strip_unused_model_inputs(inputs)
-    inputs = move_inputs_to_correct_device(inputs, model)
-
-    input_len = inputs["input_ids"].shape[1]
+    # Cohere path: use tokenized chat template directly
+    if is_cohere_reasoning_model(MODEL_NAME):
+        inputs = tokenizer.apply_chat_template(messages, **template_kwargs)
+        # Optional truncate to MAX_INPUT_TOKENS
+        inputs = truncate_inputs_to_max_length(inputs, MAX_INPUT_TOKENS)
+        inputs = strip_unused_model_inputs(inputs)
+        inputs = move_inputs_to_correct_device(inputs, model)
+        input_len = inputs["input_ids"].shape[1]
+    else:
+        # Other models: render to text and then tokenize
+        prompt_text = tokenizer.apply_chat_template(messages, **template_kwargs)  # tokenize=False here
+        # For GLM-4.6 only: prefill the assistant turn with empty think tags
+        if "glm-4.6" in MODEL_NAME.lower():
+            prompt_text = prompt_text + "<think></think>"
+        inputs = tokenizer_encode_for_chat(prompt_text)
+        inputs = strip_unused_model_inputs(inputs)
+        inputs = move_inputs_to_correct_device(inputs, model)
+        input_len = inputs["input_ids"].shape[1]
 
     # Build constrained prefix function (validate early)
     prefix_fn = None
@@ -481,7 +576,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
-
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -497,6 +591,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
+
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
 
     prompt_tokens = int(inputs["input_ids"].shape[1])
@@ -535,11 +630,11 @@ def process_batch_job(
     job_config: Dict[str, Any],
 ):
     logger.info(f"[Job {job_id}] Starting processing...")
+
     try:
         JOB_STATUS[job_id]["status"] = "processing"
 
         # 1. Read and parse the input file
-        prompts = []
         raw_requests = []
         with open(input_path, "r", encoding="utf-8") as f:
             try:
@@ -551,6 +646,8 @@ def process_batch_job(
 
         # 2. Prepare all prompts
         logger.info(f"[Job {job_id}] Preparing {len(raw_requests)} prompts...")
+
+        messages_list: List[List[Dict[str, str]]] = []
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
@@ -567,15 +664,8 @@ def process_batch_job(
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
 
-                # Build base chat template and disable reasoning for CohereLabs/command-a-reasoning-08-2025
-                template_kwargs = build_template_kwargs_for_model()
-                text = tokenizer.apply_chat_template(messages, **template_kwargs)
+                messages_list.append(messages)
 
-                # For GLM-4.6 only: prefill the assistant turn with empty think tags
-                if "glm-4.6" in MODEL_NAME.lower():
-                    text = text + "<think></think>"
-
-                prompts.append(text)
             except ValidationError as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
@@ -599,6 +689,7 @@ def process_batch_job(
         # Build prefix function if vocab is constrained
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
+        pf = None
         if vocab_lang and vocab_n_words:
             logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
             pf = build_regexp_prefix_fn(vocab_lang, vocab_n_words)
@@ -608,25 +699,77 @@ def process_batch_job(
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-        # 4. Run generation (single process / device_map path)
+        # 4. Run generation
         logger.info(f"[Job {job_id}] Running generation...")
+
         results: List[str] = []
-        for output in text_gen_pipeline(
-            prompts,
-            batch_size=BATCH_JOB_PIPELINE_SIZE,
-            return_full_text=False,
-            padding=True,
-            truncation=True,
-            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length (pipeline interprets as gen max length)
-            **generation_kwargs,
-        ):
-            results.append(output[0]["generated_text"])
+
+        if is_cohere_reasoning_model(MODEL_NAME):
+            # Cohere path: build tokenized inputs via chat template (batched)
+            encoded_list = []
+            input_lengths = []
+            for messages in messages_list:
+                tkwargs = build_template_kwargs_for_model()  # tokenize=True for Cohere
+                enc = tokenizer.apply_chat_template(messages, **tkwargs)
+                # Truncate per-sample to MAX_INPUT_TOKENS (left-truncate)
+                if enc["input_ids"].size(1) > MAX_INPUT_TOKENS:
+                    enc = truncate_inputs_to_max_length(enc, MAX_INPUT_TOKENS)
+                # Convert single-sample tensors to lists for tokenizer.pad
+                encoded_list.append({
+                    "input_ids": enc["input_ids"][0].tolist(),
+                    "attention_mask": enc["attention_mask"][0].tolist() if "attention_mask" in enc else [1] * enc["input_ids"].size(1),
+                })
+                input_lengths.append(len(encoded_list[-1]["input_ids"]))
+
+            # Pad to batch
+            batch = tokenizer.pad(
+                encoded_list,
+                padding=True,
+                pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+                return_tensors="pt",
+            )
+            batch = strip_unused_model_inputs(batch)
+            batch = move_inputs_to_correct_device(batch, model)
+
+            with torch.inference_mode():
+                outputs = model.generate(**batch, **generation_kwargs)
+
+            # Decode each item using its own input length
+            bsz = outputs.size(0)
+            for i in range(bsz):
+                in_len = input_lengths[i]
+                out_ids = outputs[i][in_len:]
+                text = tokenizer.decode(out_ids, skip_special_tokens=True)
+                results.append(text)
+        else:
+            # Other models: use pipeline with string prompts
+            prompts: List[str] = []
+            for messages in messages_list:
+                tkwargs = build_template_kwargs_for_model()  # tokenize=False for non-Cohere
+                text = tokenizer.apply_chat_template(messages, **tkwargs)
+                # For GLM-4.6 only: prefill the assistant turn with empty think tags
+                if "glm-4.6" in MODEL_NAME.lower():
+                    text = text + "<think></think>"
+                prompts.append(text)
+
+            for output in text_gen_pipeline(
+                prompts,
+                batch_size=BATCH_JOB_PIPELINE_SIZE,
+                return_full_text=False,
+                padding=True,
+                truncation=True,
+                pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+                max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length (pipeline interprets as gen max length)
+                **generation_kwargs,
+            ):
+                results.append(output[0]["generated_text"])
 
         # 5. Format and save the output file
         logger.info(f"[Job {job_id}] Formatting and saving results...")
+
         created = int(time.time())
         final_output = []
+
         for i, text in enumerate(results):
             resp = {
                 "id": f"chatcmpl-batch-{job_id}-{i}",
@@ -733,6 +876,7 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
