@@ -1,18 +1,31 @@
 import os
+
 import time
+
 import uuid
+
 import json
+
 import tempfile
+
 import unicodedata
+
 import re
+
 import logging
+
 import datetime
+
 import threading
+
 from functools import cache
+
 from typing import Optional, Dict, Any, List
 
 import torch
+
 import torch.distributed as dist
+
 from fastapi import (
     Depends,
     FastAPI,
@@ -23,9 +36,13 @@ from fastapi import (
     File,
     BackgroundTasks,
 )
+
 from fastapi.responses import FileResponse
+
 from pydantic import BaseModel, ValidationError
+
 from dotenv import load_dotenv
+
 from huggingface_hub import snapshot_download
 
 # Load environment as early as possible
@@ -81,9 +98,11 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
+
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
+
 STATIC_KV_CACHE = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
 # Constrained vocab prebuild
@@ -100,6 +119,7 @@ TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 # Config for Batch Jobs
 BATCH_JOB_TEMP_DIR = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
 BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
+
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
 
@@ -125,6 +145,7 @@ def is_rank0() -> bool:
 # -----------------------
 # Model / tokenizer load
 # -----------------------
+
 # Determine dtype from environment variable
 if TORCH_DTYPE_STR.lower() in ("bf16", "bfloat16", "torch.bfloat16"):
     TORCH_DTYPE = torch.bfloat16
@@ -162,6 +183,7 @@ model_init_kwargs: Dict[str, Any] = {
     "low_cpu_mem_usage": True,
     "local_files_only": True,  # important once staged
 }
+
 # Use new 'dtype' param to avoid deprecation warnings if not "auto"
 if TORCH_DTYPE != "auto":
     model_init_kwargs["torch_dtype"] = TORCH_DTYPE  # prefer torch_dtype kw in new transformers
@@ -190,11 +212,13 @@ def stage_model_locally():
     """
     # Make sure parent directories exist
     os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
+
     rank = 0
     world_size = 1
     if dist.is_available() and dist.is_initialized():
         rank = dist.get_rank()
         world_size = dist.get_world_size()
+
     if rank == 0:
         logger.info(f"[Staging] Snapshotting '{MODEL_NAME}' to '{LOCAL_MODEL_DIR}' (world_size={world_size})")
         # NOTE:
@@ -208,6 +232,7 @@ def stage_model_locally():
             token=HF_TOKEN,
         )
         logger.info("[Staging] Snapshot complete.")
+
     if dist.is_available() and dist.is_initialized():
         logger.info("[Staging] Waiting at distributed barrier...")
         dist.barrier()
@@ -252,6 +277,7 @@ tokenizer = AutoTokenizer.from_pretrained(
     LOCAL_MODEL_DIR, trust_remote_code=TRUST_REMOTE_CODE, local_files_only=True
 )
 tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
+
 model.eval()
 
 # Ensure a pad token is set to avoid warnings/problems during generation
@@ -329,6 +355,7 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
+
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -428,18 +455,23 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
+
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
+
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
+
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
+
     stop_ids = set(get_stop_ids(tokenizer))
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
+
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested)
@@ -544,34 +576,42 @@ def tp_worker_loop():
             return
     except Exception:
         return
+
     device = next(model.parameters()).device
     logger.info(f"[TP Worker] Rank {dist.get_rank()} entering worker loop on device {device}")
+
     while True:
         payload = _recv_obj_on_worker()
         if not payload:
             continue
+
         cmd = payload.get("cmd", "RUN")
         if cmd == "STOP":
             logger.info(f"[TP Worker] Rank {dist.get_rank()} stopping worker loop.")
             break
         if cmd != "RUN":
             continue
+
         # Rebuild inputs on this worker
         inputs_obj = payload["inputs"]
         local_inputs = {}
         for k, v in inputs_obj.items():
             # input_ids / attention_mask are integer tensors
             local_inputs[k] = torch.tensor(v, dtype=torch.long, device=device)
+
         # Rebuild generation kwargs
         gen_kwargs = dict(payload["gen_kwargs"])
+
         # Rebuild prefix fn (can't broadcast callables)
         prefix = payload.get("prefix")
         if prefix and prefix.get("lang") and prefix.get("n"):
             pf = build_regexp_prefix_fn(prefix["lang"], int(prefix["n"]))
             if pf:
                 gen_kwargs["prefix_allowed_tokens_fn"] = pf
+
         with torch.inference_mode():
-            _ = model.generate(**local_inputs, **gen_kwargs)
+             _= model.generate(**local_inputs, **gen_kwargs)
+
         # Ensure rank 0 doesn't return before all workers finish
         dist.barrier()
 
@@ -585,8 +625,10 @@ def tp_generate_on_rank0(
     """
     if not (dist.is_available() and dist.is_initialized() and is_rank0()):
         raise RuntimeError("tp_generate_on_rank0 called without distributed rank 0 ready")
+
     # Strip non-serializable entries (e.g., functions) from gen_kwargs
     safe_gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "prefix_allowed_tokens_fn"}
+
     payload = {
         "cmd": "RUN",
         "inputs": {k: v.cpu().tolist() for k, v in inputs.items()},
@@ -594,16 +636,20 @@ def tp_generate_on_rank0(
         "prefix": prefix_info if prefix_info and prefix_info.get("lang") and prefix_info.get("n") else None,
     }
     _broadcast_obj_from_rank0(payload)
+
     # Re-add the prefix function locally if needed
     local_gen_kwargs = dict(safe_gen_kwargs)
     if prefix_info and prefix_info.get("lang") and prefix_info.get("n"):
         pf = build_regexp_prefix_fn(prefix_info["lang"], int(prefix_info["n"]))
         if pf:
             local_gen_kwargs["prefix_allowed_tokens_fn"] = pf
+
     with torch.inference_mode():
         out = model.generate(**inputs, **local_gen_kwargs)
+
     # Wait for all workers
     dist.barrier()
+
     return out
 
 # Option A: DO NOT auto-start the worker in a background thread by default.
@@ -660,13 +706,13 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         if msg.role != "system":
             messages.append({"role": msg.role, "content": msg.content})
 
-    # Disable GLM-4.6 thinking via chat_template_kwargs
+    # Build base chat template (no chat_template_kwargs trick here)
     template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-    if "glm-4.6" in MODEL_NAME.lower():
-        logger.info("Applying 'enable_thinking: False' for GLM-4.6.")
-        template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}
-
     texts = tokenizer.apply_chat_template(messages, **template_kwargs)  # [1]
+
+    # For GLM-4.6 only: prefill the assistant turn with empty think tags
+    if "glm-4.6" in MODEL_NAME.lower():
+        texts = texts + "<think></think>"
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
@@ -677,7 +723,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     input_len = inputs["input_ids"].shape[1]
 
-    # Build constrained prefix function (validate early); we won't ship the callable over dist
+    # Build constrained prefix function (validate early)
     prefix_fn = None
     if req.vocab_lang and req.vocab_n_words:
         prefix_fn = build_regexp_prefix_fn(req.vocab_lang, req.vocab_n_words)
@@ -686,7 +732,6 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
-
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -782,9 +827,12 @@ def process_batch_job(
                         messages.append({"role": msg.role, "content": msg.content})
 
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
-                if "glm-4.6" in MODEL_NAME.lower():
-                    template_kwargs["chat_template_kwargs"] = {"enable_thinking": False}  # [1]
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
+
+                # For GLM-4.6 only: prefill the assistant turn with empty think tags
+                if "glm-4.6" in MODEL_NAME.lower():
+                    text = text + "<think></think>"
+
                 prompts.append(text)
 
             except ValidationError as e:
@@ -832,9 +880,11 @@ def process_batch_job(
                 inputs = tokenizer_encode_for_chat(text)
                 inputs = strip_unused_model_inputs(inputs)
                 inputs = move_inputs_to_correct_device(inputs, model)
+
                 # Remove the callable before broadcast; it will be rebuilt inside tp_generate_on_rank0
                 gk = {k: v for k, v in generation_kwargs.items() if k != "prefix_allowed_tokens_fn"}
                 outputs = tp_generate_on_rank0(inputs, gk, prefix_info=prefix_info)
+
                 input_len = inputs["input_ids"].shape[1]
                 results.append(tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True))
         else:
@@ -962,6 +1012,7 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
