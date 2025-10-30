@@ -1,31 +1,15 @@
 import os
-
 import time
-
 import uuid
-
 import json
-
 import tempfile
-
 import unicodedata
-
 import re
-
 import logging
-
-import datetime
-
-import threading
-
 from functools import cache
-
 from typing import Optional, Dict, Any, List
 
 import torch
-
-import torch.distributed as dist
-
 from fastapi import (
     Depends,
     FastAPI,
@@ -36,14 +20,9 @@ from fastapi import (
     File,
     BackgroundTasks,
 )
-
 from fastapi.responses import FileResponse
-
 from pydantic import BaseModel, ValidationError
-
 from dotenv import load_dotenv
-
-from huggingface_hub import snapshot_download
 
 # Load environment as early as possible
 load_dotenv()
@@ -74,21 +53,11 @@ app = FastAPI()
 # -----------------------
 MODEL_NAME = os.getenv("MODEL_NAME", "zai-org/GLM-4.6")
 
-# Choose how to place model across GPUs
-# - tp: tensor parallel with tp_plan='auto' (requires torch.distributed)
-# - device_map: HF device_map path (single Python process)
-PARALLEL_MODE = os.getenv("PARALLEL_MODE", "device_map").strip().lower()
-if PARALLEL_MODE not in ("tp", "device_map"):
-    logger.warning(f"Invalid PARALLEL_MODE={PARALLEL_MODE}, defaulting to 'device_map'")
-    PARALLEL_MODE = "device_map"
-
-# If TP is requested but distributed env is not ready, optionally fall back
-TP_FALLBACK_TO_DEVICE_MAP = os.getenv("TP_FALLBACK_TO_DEVICE_MAP", "true").lower() == "true"
-DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used only when PARALLEL_MODE=device_map
+# Device map (single process)
+DEVICE_MAP = os.getenv("DEVICE_MAP", "auto")  # used for model placement
 
 # If GLM-4.6 uses custom chat templates, you may need TRUST_REMOTE_CODE=true
 TRUST_REMOTE_CODE = os.getenv("TRUST_REMOTE_CODE", "false").lower() == "true"
-
 SECRET_TOKEN = os.getenv("SECRET_TOKEN", "my-secret-token-structured-generation")
 
 # Attention implementation preference
@@ -98,7 +67,6 @@ ATTN_IMPLEMENTATION = os.getenv("ATTN_IMPLEMENTATION", "flash_attention_2").stri
 TOKENIZER_PADDING_SIDE = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
 PAD_TO_MULTIPLE_OF = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "512"))
-
 ALLOWED_MAX_NEW_TOKENS = tuple(
     sorted({int(x) for x in os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512").split(",")})
 )
@@ -110,9 +78,6 @@ PREBUILD_PREFIX = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
 PREBUILD_WORD_COUNTS = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
 PREBUILD_LANGS = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
 
-# Control auto-start of TP worker loop in this module (Option A default: disabled)
-AUTO_TP_WORKER = os.getenv("AUTO_TP_WORKER", "false").lower() == "true"
-
 # Torch dtype
 TORCH_DTYPE_STR = os.getenv("TORCH_DTYPE", "auto")
 
@@ -122,25 +87,6 @@ BATCH_JOB_PIPELINE_SIZE = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
 
 logger.info(f"Batch jobs will be stored in: {BATCH_JOB_TEMP_DIR}")
 logger.info(f"Batch job pipeline size: {BATCH_JOB_PIPELINE_SIZE}")
-
-# Local staging dir for model (rank-0 will fill this once)
-# Default uses nested path so MODEL_NAME with slashes creates a subdir tree.
-LOCAL_MODEL_DIR = os.getenv("LOCAL_MODEL_DIR", os.path.join("/local_nvme/models", MODEL_NAME))
-HF_TOKEN = os.getenv("HF_TOKEN", None)  # optional private hub token
-
-# -----------------------
-# Distributed helpers
-# -----------------------
-def _ddp_env_ready():
-    return all(k in os.environ for k in ("RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT"))
-
-def is_rank0() -> bool:
-    try:
-        if dist.is_available() and dist.is_initialized():
-            return dist.get_rank() == 0
-    except Exception:
-        pass
-    return True
 
 # -----------------------
 # Model / tokenizer load
@@ -157,102 +103,35 @@ else:
     TORCH_DTYPE = "auto"
     logger.info("Using dtype: auto")
 
-# Detect if distributed is ready for TP
-USE_TP = PARALLEL_MODE == "tp"
-if USE_TP:
-    ddp_ready = dist.is_available() and (dist.is_initialized() or _ddp_env_ready())
-    if not ddp_ready:
-        msg = "PARALLEL_MODE=tp requested but torch.distributed is not initialized and env vars (RANK/WORLD_SIZE/MASTER_ADDR/MASTER_PORT) are missing."
-        if TP_FALLBACK_TO_DEVICE_MAP:
-            logger.warning(msg + " Falling back to PARALLEL_MODE=device_map for this run.")
-            USE_TP = False
-            PARALLEL_MODE = "device_map"
-        else:
-            raise OSError(
-                msg + " Start with torchrun, e.g.: "
-                "torchrun --standalone --nproc-per-node=6 --master-port=29500 tp_launcher.py"
-            )
-    elif not dist.is_initialized():
-        # Initialize process group if env is present but not yet initialized
-        logger.info("Initializing torch.distributed process group for TP...")
-        dist.init_process_group(backend="nccl", timeout=datetime.timedelta(hours=2))
-
-# Prepare model init kwargs per mode
+# Prepare model init kwargs
 model_init_kwargs: Dict[str, Any] = {
     "trust_remote_code": TRUST_REMOTE_CODE,
     "low_cpu_mem_usage": True,
-    "local_files_only": True,  # important once staged
+    "local_files_only": False,  # allow download into default HF cache
+    "device_map": DEVICE_MAP,
 }
-
 # Use new 'dtype' param to avoid deprecation warnings if not "auto"
 if TORCH_DTYPE != "auto":
     model_init_kwargs["torch_dtype"] = TORCH_DTYPE  # prefer torch_dtype kw in new transformers
 
-if USE_TP:
-    model_init_kwargs["tp_plan"] = "auto"
-    logger.info("Loading model in Tensor Parallel (tp_plan='auto') mode")
-else:
-    model_init_kwargs["device_map"] = DEVICE_MAP
-    logger.info(f"Loading model with device_map='{DEVICE_MAP}'")
-
 attn_impl = ATTN_IMPLEMENTATION
 logger.info(
     f"Preparing to load model '{MODEL_NAME}' "
-    f"(Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}')..."
+    f"(Trust Remote Code: {TRUST_REMOTE_CODE}, attn='{attn_impl}', device_map='{DEVICE_MAP}')..."
 )
 
-# ---------------
-# Rank-0 staging
-# ---------------
-def stage_model_locally():
-    """
-    Rank-0 downloads/snapshots the model repo into LOCAL_MODEL_DIR.
-    Other ranks wait at a barrier (if distributed is initialized).
-    After the barrier, all ranks load strictly from local disk.
-    """
-    # Make sure parent directories exist
-    os.makedirs(LOCAL_MODEL_DIR, exist_ok=True)
-
-    rank = 0
-    world_size = 1
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-
-    if rank == 0:
-        logger.info(f"[Staging] Snapshotting '{MODEL_NAME}' to '{LOCAL_MODEL_DIR}' (world_size={world_size})")
-        # NOTE:
-        # - local_dir_use_symlinks=False ensures a plain copy rather than symlinks
-        # - HF_HUB_ENABLE_HF_TRANSFER=1 env speeds up downloads
-        # - snapshot_download is idempotent; it won’t redownload if already present
-        snapshot_download(
-            repo_id=MODEL_NAME,
-            local_dir=LOCAL_MODEL_DIR,
-            local_dir_use_symlinks=False,
-            token=HF_TOKEN,
-        )
-        logger.info("[Staging] Snapshot complete.")
-
-    if dist.is_available() and dist.is_initialized():
-        logger.info("[Staging] Waiting at distributed barrier...")
-        dist.barrier()
-        logger.info("[Staging] Barrier complete for all ranks.")
-
-# Stage before calling any from_pretrained
-stage_model_locally()
-
-# Now load from LOCAL_MODEL_DIR only
-logger.info("Loading model from local staged directory...")
+# Load from hub/cache directly
+logger.info("Loading model from hub/cache...")
 try:
     model = AutoModelForCausalLM.from_pretrained(
-        LOCAL_MODEL_DIR,
+        MODEL_NAME,
         attn_implementation=attn_impl,
         **model_init_kwargs,
     )
 except TypeError:
     logger.warning("Model.from_pretrained() did not accept 'attn_implementation'; loading without it.")
     model = AutoModelForCausalLM.from_pretrained(
-        LOCAL_MODEL_DIR,
+        MODEL_NAME,
         **model_init_kwargs,
     )
     # Try to set after load
@@ -274,10 +153,9 @@ if STATIC_KV_CACHE:
         logger.warning(f"Static KV cache not available: {e}")
 
 tokenizer = AutoTokenizer.from_pretrained(
-    LOCAL_MODEL_DIR, trust_remote_code=TRUST_REMOTE_CODE, local_files_only=True
+    MODEL_NAME, trust_remote_code=TRUST_REMOTE_CODE, local_files_only=False
 )
 tokenizer.padding_side = TOKENIZER_PADDING_SIDE  # left-padding for better KV/cache perf
-
 model.eval()
 
 # Ensure a pad token is set to avoid warnings/problems during generation
@@ -290,7 +168,7 @@ if tokenizer.pad_token_id is None:
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], m):
     """
     Always move inputs to the device of the model's first parameter.
-    Works for both device_map and TP-sharded models (first param device is fine).
+    Works for device_map-sharded models (first param device is fine).
     """
     try:
         device = next(m.parameters()).device
@@ -355,7 +233,6 @@ def get_stop_ids(tok: AutoTokenizer) -> List[int]:
             stop_ids.append(tok.eos_token_id)
         elif isinstance(tok.eos_token_id, list):
             stop_ids.extend(tok.eos_token_id)
-
     common_end_markers = (
         "<end_of_turn>",
         "<|eot_id|>",
@@ -378,6 +255,7 @@ def normalizeword(w: str) -> str:
 
 class _TrieNode:
     __slots__ = ("children", "end", "min_rank")
+
     def __init__(self):
         self.children: Dict[str, "_TrieNode"] = {}
         self.end: bool = False
@@ -455,19 +333,16 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     if getor_build_trie(lang) is None:
         logger.warning(f"Language file not found or empty: {lang}.txt. Skipping build.")
         return None
-
     word_regex = buildword_regex_for_n(lang, n_words)
     if not word_regex:
         logger.warning(f"No words available for {lang} with n={n_words}. Skipping build.")
         return None
-
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
-
     parser = RegexParser(flexible_grammar)
     base_prefix_fn = build_transformers_prefix_allowed_tokens_fn(tokenizer, parser)
-
     stop_ids = set(get_stop_ids(tokenizer))
+
     def wrapped_prefix_fn(batch_id, input_ids):
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids)
@@ -475,35 +350,19 @@ def build_regexp_prefix_fn(lang: str, n_words: int):
     return wrapped_prefix_fn
 
 # Startup prebuilds (if requested)
-# - In TP mode: prebuild on ALL ranks (to avoid first-request rebuild).
-# - In device_map: prebuild once on rank 0 only.
 if PREBUILD_PREFIX:
     if PREBUILD_LANGS:
-        if USE_TP:
-            logger.info("Prebuilding prefix functions (all TP ranks)...")
-            for lang in PREBUILD_LANGS:
-                if not _safe_lang_name(lang):
-                    logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
-                    continue
-                for n_words in PREBUILD_WORD_COUNTS:
-                    try:
-                        build_regexp_prefix_fn(lang, n_words)
-                    except Exception as e:
-                        logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
-            logger.info("Prebuild done.")
-        else:
-            if is_rank0():
-                logger.info("Prebuilding prefix functions (single process/device_map)...")
-                for lang in PREBUILD_LANGS:
-                    if not _safe_lang_name(lang):
-                        logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
-                        continue
-                    for n_words in PREBUILD_WORD_COUNTS:
-                        try:
-                            build_regexp_prefix_fn(lang, n_words)
-                        except Exception as e:
-                            logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
-                logger.info("Prebuild done.")
+        logger.info("Prebuilding prefix functions (single process/device_map)...")
+        for lang in PREBUILD_LANGS:
+            if not _safe_lang_name(lang):
+                logger.warning(f"Skipping unsafe language name in PREBUILD_LANGS: {lang}")
+                continue
+            for n_words in PREBUILD_WORD_COUNTS:
+                try:
+                    build_regexp_prefix_fn(lang, n_words)
+                except Exception as e:
+                    logger.warning(f"Prebuild failed for {lang}, n={n_words}: {e}")
+        logger.info("Prebuild done.")
     else:
         logger.info("PREBUILD_PREFIX is enabled but PREBUILD_LANGS is empty; skipping prebuild.")
 
@@ -548,118 +407,6 @@ def getgen_kwargs(
         else:
             gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
     return gen_kwargs
-
-# -----------------------
-# TP helpers (broadcast + worker loop)
-# -----------------------
-def _broadcast_obj_from_rank0(obj: Any):
-    if not (dist.is_available() and dist.is_initialized()):
-        raise RuntimeError("Distributed not initialized for TP broadcast")
-    buf = [obj]
-    dist.broadcast_object_list(buf, src=0)
-
-def _recv_obj_on_worker() -> Any:
-    buf = [None]
-    dist.broadcast_object_list(buf, src=0)
-    return buf[0]
-
-def tp_worker_loop():
-    """
-    Non-rank0 processes wait for broadcast requests and run model.generate()
-    in lockstep with rank 0. This enables Tensor Parallel inference from an
-    HTTP server that runs on rank 0 only.
-    """
-    try:
-        if not (dist.is_available() and dist.is_initialized()):
-            return
-        if is_rank0():
-            return
-    except Exception:
-        return
-
-    device = next(model.parameters()).device
-    logger.info(f"[TP Worker] Rank {dist.get_rank()} entering worker loop on device {device}")
-
-    while True:
-        payload = _recv_obj_on_worker()
-        if not payload:
-            continue
-
-        cmd = payload.get("cmd", "RUN")
-        if cmd == "STOP":
-            logger.info(f"[TP Worker] Rank {dist.get_rank()} stopping worker loop.")
-            break
-        if cmd != "RUN":
-            continue
-
-        # Rebuild inputs on this worker
-        inputs_obj = payload["inputs"]
-        local_inputs = {}
-        for k, v in inputs_obj.items():
-            # input_ids / attention_mask are integer tensors
-            local_inputs[k] = torch.tensor(v, dtype=torch.long, device=device)
-
-        # Rebuild generation kwargs
-        gen_kwargs = dict(payload["gen_kwargs"])
-
-        # Rebuild prefix fn (can't broadcast callables)
-        prefix = payload.get("prefix")
-        if prefix and prefix.get("lang") and prefix.get("n"):
-            pf = build_regexp_prefix_fn(prefix["lang"], int(prefix["n"]))
-            if pf:
-                gen_kwargs["prefix_allowed_tokens_fn"] = pf
-
-        with torch.inference_mode():
-             _= model.generate(**local_inputs, **gen_kwargs)
-
-        # Ensure rank 0 doesn't return before all workers finish
-        dist.barrier()
-
-def tp_generate_on_rank0(
-    inputs: Dict[str, torch.Tensor],
-    gen_kwargs: Dict[str, Any],
-    prefix_info: Optional[Dict[str, Any]] = None
-):
-    """
-    Rank 0 path: broadcast request to workers, run local generate, wait barrier, return outputs.
-    """
-    if not (dist.is_available() and dist.is_initialized() and is_rank0()):
-        raise RuntimeError("tp_generate_on_rank0 called without distributed rank 0 ready")
-
-    # Strip non-serializable entries (e.g., functions) from gen_kwargs
-    safe_gen_kwargs = {k: v for k, v in gen_kwargs.items() if k != "prefix_allowed_tokens_fn"}
-
-    payload = {
-        "cmd": "RUN",
-        "inputs": {k: v.cpu().tolist() for k, v in inputs.items()},
-        "gen_kwargs": safe_gen_kwargs,
-        "prefix": prefix_info if prefix_info and prefix_info.get("lang") and prefix_info.get("n") else None,
-    }
-    _broadcast_obj_from_rank0(payload)
-
-    # Re-add the prefix function locally if needed
-    local_gen_kwargs = dict(safe_gen_kwargs)
-    if prefix_info and prefix_info.get("lang") and prefix_info.get("n"):
-        pf = build_regexp_prefix_fn(prefix_info["lang"], int(prefix_info["n"]))
-        if pf:
-            local_gen_kwargs["prefix_allowed_tokens_fn"] = pf
-
-    with torch.inference_mode():
-        out = model.generate(**inputs, **local_gen_kwargs)
-
-    # Wait for all workers
-    dist.barrier()
-
-    return out
-
-# Option A: DO NOT auto-start the worker in a background thread by default.
-# Leave control to tp_launcher.py (AUTO_TP_WORKER default false).
-try:
-    if AUTO_TP_WORKER and USE_TP and dist.is_available() and dist.is_initialized() and not is_rank0():
-        threading.Thread(target=tp_worker_loop, daemon=True).start()
-        logger.info("[TP Worker] Background worker loop thread started.")
-except Exception as e:
-    logger.warning(f"Could not start TP worker loop automatically: {e}")
 
 # -----------------------
 # OpenAI-compatible API
@@ -712,7 +459,8 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     # For GLM-4.6 only: prefill the assistant turn with empty think tags
     if "glm-4.6" in MODEL_NAME.lower():
-        texts = texts + "<think></think>"
+        texts = texts + "
+"
 
     # Tokenize with left padding, truncation, pad_to_multiple_of
     inputs = tokenizer_encode_for_chat(texts)
@@ -732,6 +480,7 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
 
     max_new_tokens = normalize_max_new_tokens(req.max_tokens)
     stop_ids = get_stop_ids(tokenizer)
+
     gen_kwargs = getgen_kwargs(
         max_new_tokens=max_new_tokens,
         stop_ids=stop_ids,
@@ -740,23 +489,15 @@ def chat_completions(req: ChatCompletionRequest, auth_ok: bool = Depends(verify_
         prefix_fn=prefix_fn
     )
 
-    # In TP mode: broadcast request and run generate on all ranks
-    use_tp_generate = USE_TP and dist.is_available() and dist.is_initialized() and is_rank0()
-    if use_tp_generate:
-        prefix_info = None
-        if req.vocab_lang and req.vocab_n_words:
-            prefix_info = {"lang": req.vocab_lang, "n": int(req.vocab_n_words)}
-        outputs = tp_generate_on_rank0(inputs, gen_kwargs, prefix_info=prefix_info)
-    else:
-        with torch.inference_mode():
-            outputs = model.generate(**inputs, **gen_kwargs)
+    with torch.inference_mode():
+        outputs = model.generate(**inputs, **gen_kwargs)
 
     # Determine finish reason
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
     finish_reason = "stop" if stop_ids and (last_token in set(stop_ids)) else ("length" if gen_len >= max_new_tokens else "stop")
-
     text = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+
     prompt_tokens = int(inputs["input_ids"].shape[1])
     completion_tokens = gen_len
     created = int(time.time())
@@ -812,29 +553,23 @@ def process_batch_job(
         for i, req_data in enumerate(raw_requests):
             try:
                 req = ChatCompletionRequest(**req_data)
-
                 system_prompt = ""
                 for msg in req.messages:
                     if msg.role == "system":
                         system_prompt = msg.content
                         break
-
                 messages = []
                 if system_prompt != "":
                     messages.append({"role": "system", "content": system_prompt})
                 for msg in req.messages:
                     if msg.role != "system":
                         messages.append({"role": msg.role, "content": msg.content})
-
                 template_kwargs = {"tokenize": False, "add_generation_prompt": True}
                 text = tokenizer.apply_chat_template(messages, **template_kwargs)
-
                 # For GLM-4.6 only: prefill the assistant turn with empty think tags
                 if "glm-4.6" in MODEL_NAME.lower():
                     text = text + "<think></think>"
-
                 prompts.append(text)
-
             except ValidationError as e:
                 logger.warning(f"[Job {job_id}] Skipping request {i}: Invalid format. {e}")
             except Exception as e:
@@ -858,49 +593,30 @@ def process_batch_job(
         # Build prefix function if vocab is constrained
         vocab_lang = job_config.get("vocab_lang")
         vocab_n_words = job_config.get("vocab_n_words")
-        prefix_info = None
         if vocab_lang and vocab_n_words:
             logger.info(f"[Job {job_id}] Building constrained vocab for {vocab_lang} ({vocab_n_words} words)")
             pf = build_regexp_prefix_fn(vocab_lang, vocab_n_words)
             if pf:
                 generation_kwargs["prefix_allowed_tokens_fn"] = pf
-                prefix_info = {"lang": vocab_lang, "n": int(vocab_n_words)}
                 logger.info(f"[Job {job_id}] Successfully added prefix function.")
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'. Check server logs.")
 
-        # 4. Run generation
+        # 4. Run generation (single process / device_map path)
         logger.info(f"[Job {job_id}] Running generation...")
         results: List[str] = []
-
-        use_tp_generate = USE_TP and dist.is_available() and dist.is_initialized() and is_rank0()
-        if use_tp_generate:
-            # Run prompts one by one in TP mode
-            for text in prompts:
-                inputs = tokenizer_encode_for_chat(text)
-                inputs = strip_unused_model_inputs(inputs)
-                inputs = move_inputs_to_correct_device(inputs, model)
-
-                # Remove the callable before broadcast; it will be rebuilt inside tp_generate_on_rank0
-                gk = {k: v for k, v in generation_kwargs.items() if k != "prefix_allowed_tokens_fn"}
-                outputs = tp_generate_on_rank0(inputs, gk, prefix_info=prefix_info)
-
-                input_len = inputs["input_ids"].shape[1]
-                results.append(tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True))
-        else:
-            # Use HF pipeline path in single-process mode for throughput
-            for output in text_gen_pipeline(
-                prompts,
-                batch_size=BATCH_JOB_PIPELINE_SIZE,
-                return_full_text=False,
-                padding=True,
-                truncation=True,
-                pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
-                max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length
-                return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
-                **generation_kwargs,
-            ):
-                results.append(output[0]["generated_text"])
+        for output in text_gen_pipeline(
+            prompts,
+            batch_size=BATCH_JOB_PIPELINE_SIZE,
+            return_full_text=False,
+            padding=True,
+            truncation=True,
+            pad_to_multiple_of=PAD_TO_MULTIPLE_OF,
+            max_length=MAX_INPUT_TOKENS,         # tokenizer truncation length (note: pipeline interprets this as gen max length)
+            return_token_type_ids=False,          # IMPORTANT: avoid token_type_ids in pipeline
+            **generation_kwargs,
+        ):
+            results.append(output[0]["generated_text"])
 
         # 5. Format and save the output file
         logger.info(f"[Job {job_id}] Formatting and saving results...")
@@ -932,7 +648,6 @@ def process_batch_job(
 
         JOB_STATUS[job_id]["status"] = "completed"
         logger.info(f"[Job {job_id}] Processing complete.")
-
     except Exception as e:
         logger.error(f"[Job {job_id}] Processing FAILED: {e}")
         JOB_STATUS[job_id]["status"] = "failed"
@@ -1012,7 +727,6 @@ def get_batch_job_results(job_id: str, auth_ok: bool = Depends(verify_token)):
     job = JOB_STATUS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-
     if job["status"] == "completed":
         output_path = job["output_path"]
         if not os.path.exists(output_path):
