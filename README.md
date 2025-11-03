@@ -61,7 +61,7 @@ Use `vocab_lang` + `vocab_n_words` to enable constrained vocabulary generation.
 - If you change `PREBUILD_LANGS` or wordlists, restart the server to rebuild prefix constraints.
 
 
-# Batching
+## Batching
 This job will use num_beams=4 AND the Spanish vocab with 1000 words
 curl -X POST "http://127.0.0.1:8000/v1/batch/jobs?token=my-secret-token-structured-generation&num_beams=4&vocab_lang=es&vocab_n_words=1000" \
      -F "file=@/path/to/your/requests.json"
