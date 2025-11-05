@@ -46,9 +46,3 @@ class Settings:
     # Batch jobs
     BATCH_JOB_TEMP_DIR: str = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
     BATCH_JOB_PIPELINE_SIZE: int = int(os.getenv("BATCH_JOB_PIPELINE_SIZE", "8"))
-
-    # Qwen3 MoE fused backend (toggle)
-    # Enable this when using fused checkpoints like "woctordho/Qwen3-30B-A3B-fused"
-    MOE_FUSED_ENABLE: bool = os.getenv("MOE_FUSED_ENABLE", "false").lower() == "true"
-    # Optional: turn on Triton autotuning logs for kernel selection
-    MOE_FUSED_TRITON_AUTOTUNING: bool = os.getenv("MOE_FUSED_TRITON_AUTOTUNING", "false").lower() == "true"
