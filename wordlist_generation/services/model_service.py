@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
@@ -54,31 +54,33 @@ class ModelService:
             os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 
         model = None
-        tokenizer = None
 
+        # Enable fused path only when requested and the repo looks like a fused Qwen3 MoE checkpoint
         use_fused = bool(getattr(s, "MOE_FUSED_ENABLE", False)) and ("qwen3" in s.MODEL_NAME.lower()) and ("fused" in s.MODEL_NAME.lower())
 
         if use_fused:
             logger.info(f"Loading fused Qwen3 MoE model '{s.MODEL_NAME}' (device_map='{s.DEVICE_MAP}')")
             try:
-                # Import only when needed
-                from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
-
-                # Enable fused bitsandbytes quantizer if this is a 4-bit fused repo
+                # IMPORTANT: Patch the BnB quantizer BEFORE importing the fused model class
                 if "bnb-4bit" in s.MODEL_NAME.lower():
                     from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
                     patch_bnb_quantizer()
                     logger.info("Patched bitsandbytes quantizer for fused 4-bit.")
 
+                # Import after patching so modules register correct 4-bit params
+                from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
+
+                # Do NOT pass attn_implementation here; fused class doesn’t use it
                 model = Qwen3MoeFusedForCausalLM.from_pretrained(
                     s.MODEL_NAME,
                     **init_kwargs,
                 )
             except Exception as e:
-                logger.error(f"Failed to load fused MoE model '{s.MODEL_NAME}': {e}. Falling back to AutoModel.")
-                use_fused = False
+                # Falling back to AutoModel cannot work for fused checkpoints; abort clearly
+                logger.error(f"Fused MoE load failed for '{s.MODEL_NAME}': {e}")
+                raise
 
-        if not use_fused:
+        else:
             logger.info(
                 f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
                 f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
