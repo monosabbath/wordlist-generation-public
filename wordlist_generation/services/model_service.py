@@ -22,6 +22,10 @@ class ModelService:
     def from_settings(cls, s):
         # Torch backend knobs
         torch.backends.cuda.matmul.allow_tf32 = True
+        try:
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
 
         # Dtype selection
         dtype: Any = "auto"
