@@ -2,11 +2,6 @@
 
 FastAPI server for vocabulary‑constrained text generation using Hugging Face Transformers and lm‑format‑enforcer. It exposes an OpenAI‑compatible chat completions endpoint and a simple batch job system. The code is modular for readability and maintainability.
 
-- Language: Python 3.12
-- Inference stack: transformers, torch, accelerate
-- Constraints: trie → regex with lm‑format‑enforcer
-- Auth: simple bearer token or `?token=...` query param
-
 ---
 
 ## Quickstart
