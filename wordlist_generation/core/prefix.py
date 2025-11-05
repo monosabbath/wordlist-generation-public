@@ -93,7 +93,17 @@ def buildword_regex_for_n(lang: str, n_words: int, wordlist_dir: str) -> Optiona
     return trieto_regex(trie, nlimit=n_words)
 
 
-@lru_cache(maxsize=128)
+# Process-local cache keyed by hashable signature instead of tokenizer object
+_PREFIX_FN_CACHE: Dict[Tuple[str, str, int, str, bool], Any] = {}
+
+
+def _prefix_cache_key(tokenizer, lang: str, n_words: int, wordlist_dir: str, allow_cohere_controls: bool) -> Tuple[str, str, int, str, bool]:
+    name = getattr(tokenizer, "name_or_path", tokenizer.__class__.__name__)
+    # Include eos id to differentiate tokenizers with same name but different specials
+    eos = str(getattr(tokenizer, "eos_token_id", "None"))
+    return (name, eos, n_words, f"{wordlist_dir}:{lang}", allow_cohere_controls)
+
+
 def build_regexp_prefix_fn(
     tokenizer,
     lang: str,
@@ -101,12 +111,17 @@ def build_regexp_prefix_fn(
     wordlist_dir: str,
     allow_cohere_controls: bool = False,
 ):
+    key = _prefix_cache_key(tokenizer, lang, n_words, wordlist_dir, allow_cohere_controls)
+    if key in _PREFIX_FN_CACHE:
+        return _PREFIX_FN_CACHE[key]
+
     if getor_build_trie(lang, wordlist_dir) is None:
         return None
     word_regex = buildword_regex_for_n(lang, n_words, wordlist_dir)
     if not word_regex:
         return None
 
+    # allow words separated by punctuation/whitespace; flexible boundaries
     punct_regex = r'[.,!?¿¡…\s]+'
     flexible_grammar = fr'(?:{punct_regex})?(?:{word_regex})(?:{punct_regex}(?:{word_regex}))*(?:{punct_regex})?'
 
@@ -120,4 +135,5 @@ def build_regexp_prefix_fn(
         allowed = set(base_prefix_fn(batch_id, input_ids))
         return list(allowed | stop_ids | cohere_ids)
 
+    _PREFIX_FN_CACHE[key] = wrapped_prefix_fn
     return wrapped_prefix_fn
