@@ -26,6 +26,9 @@ dependencies = [
     "tiktoken",
     "sentencepiece",
     "uvicorn>=0.30.0",
+
+    # Qwen3 MoE fused backend (pin to the commit you tested)
+    "git+https://github.com/woct0rdho/transformers-qwen3-moe-fused@4caa1524b8f691d24da2fa26e99711b2ec77db44",
 ]
 
 [dependency-groups]
