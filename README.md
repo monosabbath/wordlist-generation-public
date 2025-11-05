@@ -24,22 +24,15 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e .
 ```
 
-3) Create and edit your .env (example shown below):
+3) Place any wordlists (e.g., `es.txt`) in the `wordlists/` directory. The repo includes `wordlists/es.txt` as an example.
 
-```bash
-cp .env.example .env
-# then edit .env with your settings
-```
-
-4) Place any wordlists (e.g., `es.txt`) in the `wordlists/` directory. The repo includes `wordlists/es.txt` as an example.
-
-5) Run the server:
+4) Run the server:
 
 ```bash
 uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
 ```
 
-6) Test authentication:
+5) Test authentication:
 
 ```bash
 curl -H "Authorization: Bearer <your-secret-token>" http://127.0.0.1:8010/v1/models
