@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoModelForConditionalGeneration, AutoTokenizer, pipeline
 
 logger = logging.getLogger("model-service")
 
@@ -53,12 +53,41 @@ class ModelService:
             f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
         )
 
+        # Try CausalLM first (covers most decoder-only models). If the config is Mistral3,
+        # fall back to ConditionalGeneration which is what Mistral-Small-3.2 uses.
+        model = None
         try:
             model = AutoModelForCausalLM.from_pretrained(
                 s.MODEL_NAME,
                 attn_implementation=s.ATTN_IMPLEMENTATION,
                 **init_kwargs,
             )
+        except ValueError as e:
+            # Typical message: Unrecognized configuration class ... Mistral3Config for AutoModelForCausalLM
+            if "Mistral3Config" in str(e) or "mistral3" in s.MODEL_NAME.lower():
+                logger.info("Detected Mistral3 configuration; falling back to AutoModelForConditionalGeneration.")
+                try:
+                    model = AutoModelForConditionalGeneration.from_pretrained(
+                        s.MODEL_NAME,
+                        attn_implementation=s.ATTN_IMPLEMENTATION,
+                        **init_kwargs,
+                    )
+                except TypeError:
+                    logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+                    model = AutoModelForConditionalGeneration.from_pretrained(
+                        s.MODEL_NAME,
+                        **init_kwargs,
+                    )
+                    try:
+                        model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
+                    except Exception as e2:
+                        logger.warning(f"Could not set attention implementation: {e2}. Falling back to SDPA if possible.")
+                        try:
+                            model.set_attention_implementation("sdpa")
+                        except Exception as e3:
+                            logger.warning(f"Could not set SDPA either: {e3}")
+            else:
+                raise
         except TypeError:
             logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
             model = AutoModelForCausalLM.from_pretrained(
