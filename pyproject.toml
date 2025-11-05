@@ -1,11 +1,10 @@
 [project]
 name = "wordlist-generation"
-version = "0.2.1"
+version = "0.2.2"
 description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
 
-# Updated to include mistral-common for Mistral-Small-3.2-24B-Instruct-2506 tokenizer support
 dependencies = [
     "accelerate>=0.32.0",
     "fastapi[standard]",
@@ -15,10 +14,15 @@ dependencies = [
     "python-dotenv",
     "safetensors",
     "torch",
-    "transformers>=4.57.0",
+    # Mistral 3.x support stack
+    "transformers>=4.46.2,<5.0.0",
+    "tokenizers>=0.20.1",
+    "huggingface_hub>=0.24.6",
     "mistral-common>=1.6.2",
+    # Optional GPU quant + compression
     "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "compressed-tensors",
+    # Tokenizers used by some models
     "tiktoken",
     "sentencepiece",
     "uvicorn>=0.30.0",
