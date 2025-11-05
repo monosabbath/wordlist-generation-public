@@ -61,18 +61,15 @@ class ModelService:
         if use_fused:
             logger.info(f"Loading fused Qwen3 MoE model '{s.MODEL_NAME}' (device_map='{s.DEVICE_MAP}')")
             try:
+                # Import only when needed
                 from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
-            except Exception as e:
-                raise RuntimeError(
-                    "MOE_FUSED_ENABLE=true but qwen3_moe_fused is not importable. "
-                    "Install it first, e.g.:\n"
-                    "  pip install -U pip setuptools wheel\n"
-                    "  sudo apt-get update && sudo apt-get install -y git  # ensure git is available\n"
-                    "  pip install -r requirements-moe.txt\n"
-                    "Or: pip install \"transformers-qwen3-moe-fused @ git+https://github.com/woct0rdho/transformers-qwen3-moe-fused@4caa1524b8f691d24da2fa26e99711b2ec77db44\""
-                ) from e
 
-            try:
+                # Enable fused bitsandbytes quantizer if this is a 4-bit fused repo
+                if "bnb-4bit" in s.MODEL_NAME.lower():
+                    from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
+                    patch_bnb_quantizer()
+                    logger.info("Patched bitsandbytes quantizer for fused 4-bit.")
+
                 model = Qwen3MoeFusedForCausalLM.from_pretrained(
                     s.MODEL_NAME,
                     **init_kwargs,
