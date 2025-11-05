@@ -1,15 +1,86 @@
+import json
 import logging
 from typing import Any, Dict
 
 import torch
+from huggingface_hub import hf_hub_download
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    PreTrainedTokenizerFast,
     pipeline,
 )
 
 logger = logging.getLogger("model-service")
+
+
+def _build_tokenizer_from_repo_files(model_id: str, padding_side: str):
+    """
+    Fallback tokenizer builder for models whose tokenizer class is not exposed by Transformers.
+    It constructs a PreTrainedTokenizerFast from tokenizer.json and wires in chat_template and specials
+    from tokenizer_config.json so apply_chat_template works as expected.
+    """
+    # Load tokenizer config for chat template and special tokens
+    chat_template = None
+    bos_token = None
+    eos_token = None
+    pad_token = None
+    unk_token = None
+    additional_special_tokens = None
+
+    try:
+        tok_cfg_path = hf_hub_download(repo_id=model_id, filename="tokenizer_config.json")
+        with open(tok_cfg_path, "r", encoding="utf-8") as f:
+            tok_cfg = json.load(f)
+        chat_template = tok_cfg.get("chat_template")
+        bos_token = tok_cfg.get("bos_token")
+        eos_token = tok_cfg.get("eos_token")
+        pad_token = tok_cfg.get("pad_token")
+        unk_token = tok_cfg.get("unk_token")
+        additional_special_tokens = tok_cfg.get("additional_special_tokens")
+    except Exception as e:
+        logger.warning(f"Could not load tokenizer_config.json for {model_id}: {e}. Proceeding without it.")
+
+    # Load the fast tokenizer JSON (required)
+    try:
+        tok_json_path = hf_hub_download(repo_id=model_id, filename="tokenizer.json")
+    except Exception as e:
+        raise RuntimeError(
+            f"Could not download tokenizer.json from {model_id}. "
+            f"If this model requires a custom tokenizer, install mistral-common and use remote code. "
+            f"Original error: {e}"
+        )
+
+    # Build a fast tokenizer directly from the json file
+    tok = PreTrainedTokenizerFast(
+        tokenizer_file=tok_json_path,
+        bos_token=bos_token,
+        eos_token=eos_token,
+        pad_token=pad_token,
+        unk_token=unk_token,
+    )
+    if additional_special_tokens:
+        try:
+            tok.add_special_tokens({"additional_special_tokens": additional_special_tokens})
+        except Exception:
+            # Ignore if already present or incompatible
+            pass
+
+    # Wire in chat template if provided so apply_chat_template works
+    if chat_template:
+        try:
+            tok.chat_template = chat_template
+        except Exception as e:
+            logger.warning(f"Could not set chat_template on tokenizer: {e}")
+
+    tok.padding_side = padding_side
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+
+    # Niceties for downstream code
+    tok.name_or_path = model_id
+    return tok
 
 
 class ModelService:
@@ -21,6 +92,7 @@ class ModelService:
 
     @property
     def is_cohere_reasoning_model(self) -> bool:
+        # Keep original behavior (used only to optionally allow Cohere control tokens in prefix fn).
         return self.settings.MODEL_NAME.strip().lower() == "coherelabs/command-a-reasoning-08-2025"
 
     @classmethod
@@ -67,6 +139,7 @@ class ModelService:
         if model_type == "mistral3" or "Mistral3Config" in cfg_name:
             try:
                 from transformers import Mistral3ForConditionalGeneration  # type: ignore
+
                 try:
                     model = Mistral3ForConditionalGeneration.from_pretrained(
                         s.MODEL_NAME,
@@ -114,8 +187,7 @@ class ModelService:
                     except Exception as e2:
                         logger.warning(f"Could not set SDPA either: {e2}")
 
-        # Load tokenizer with Mistral3 fallback
-        tokenizer = None
+        # Load tokenizer with robust fallbacks
         try:
             tokenizer = AutoTokenizer.from_pretrained(
                 s.MODEL_NAME,
@@ -123,22 +195,12 @@ class ModelService:
                 local_files_only=False,
             )
         except KeyError as e:
-            # Example: KeyError: <class '...Mistral3Config'>
-            if model_type == "mistral3" or "Mistral3Config" in str(e):
-                try:
-                    from transformers import Mistral3Tokenizer  # type: ignore
-                except ImportError as e2:
-                    raise RuntimeError(
-                        "Transformers build does not expose Mistral3Tokenizer. "
-                        "Upgrade with: pip install -U 'transformers>=4.46.2' 'tokenizers>=0.20.1'"
-                    ) from e2
-                tokenizer = Mistral3Tokenizer.from_pretrained(
-                    s.MODEL_NAME,
-                    trust_remote_code=s.TRUST_REMOTE_CODE,
-                    local_files_only=False,
-                )
-            else:
-                raise
+            # Typical: KeyError on Mistral3Config when TOKENIZER_MAPPING lacks an entry
+            logger.info(f"AutoTokenizer failed with {e}; falling back to repo files for tokenizer.")
+            tokenizer = _build_tokenizer_from_repo_files(s.MODEL_NAME, s.TOKENIZER_PADDING_SIDE)
+        except Exception as e:
+            logger.warning(f"AutoTokenizer raised {e}; attempting repo-file fallback.")
+            tokenizer = _build_tokenizer_from_repo_files(s.MODEL_NAME, s.TOKENIZER_PADDING_SIDE)
 
         tokenizer.padding_side = s.TOKENIZER_PADDING_SIDE
         if tokenizer.pad_token_id is None:
