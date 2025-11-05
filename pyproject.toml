@@ -3,7 +3,7 @@ name = "wordlist-generation"
 version = "0.2.1"
 description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
-requires-python = ">=3.12, <3.13"
+requires-python = ">=3.11, <3.13"
 
 # Updated to include mistral-common for Mistral-Small-3.2-24B-Instruct-2506 tokenizer support
 dependencies = [
