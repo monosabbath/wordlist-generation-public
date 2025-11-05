@@ -36,7 +36,7 @@ cp .env.example .env
 5) Run the server:
 
 ```bash
-uvicorn wordlist_generation.main:app --reload --host 0.0.0.0 --port 8010
+uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
 ```
 
 6) Test authentication:
