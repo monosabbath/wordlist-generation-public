@@ -9,6 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
-# Other
+# Env and secrets
+.env
+.env.*
 secrets.toml
+
+# Lockfiles
 uv.lock
+
+# OS junk
+.DS_Store
+Thumbs.db
