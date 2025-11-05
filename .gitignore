@@ -9,11 +9,6 @@ wheels/
 # Virtual environments
 .venv
 
-# Env and secrets
-.env
-.env.*
-secrets.toml
-
 # Lockfiles
 uv.lock
 
