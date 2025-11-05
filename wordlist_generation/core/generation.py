@@ -25,10 +25,15 @@ def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torc
     return inputs
 
 def normalize_max_new_tokens(requested: Optional[int], allowed: Optional[tuple[int, ...]]) -> int:
-    if not allowed:
-        return min(int(requested) if requested else 512, 512)
-    target = int(requested) if requested is not None else 512
-    target = min(target, 512)
+    # Use the configured allowed set to determine the cap; fall back to 512 if not provided.
+    if not allowed or len(allowed) == 0:
+        cap = 512
+        target = int(requested) if requested is not None else cap
+        return min(target, cap)
+    # allowed is sorted in Settings; use its max as cap
+    cap = allowed[-1]
+    target = int(requested) if requested is not None else cap
+    target = min(target, cap)
     for a in allowed:
         if target <= a:
             return a
@@ -84,6 +89,7 @@ def getgen_kwargs(
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
         do_sample=False,
+        # Consider lowering default beams to 1-4 for latency; 10 is very slow.
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
     )
