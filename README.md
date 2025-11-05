@@ -6,7 +6,7 @@ FastAPI server for vocabulary‑constrained text generation using Hugging Face T
 
 ## Quickstart
 
-1) Create a virtual environment (Python 3.12):
+1) Create a virtual environment:
 
 ```bash
 python -m venv .venv
