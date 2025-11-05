@@ -50,25 +50,29 @@ class ModelService:
             init_kwargs["torch_dtype"] = dtype
 
         # Optional Triton autotuning logs for fused kernels
-        if s.MOE_FUSED_TRITON_AUTOTUNING:
+        if getattr(s, "MOE_FUSED_TRITON_AUTOTUNING", False):
             os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 
         model = None
         tokenizer = None
 
-        use_fused = bool(s.MOE_FUSED_ENABLE) and ("qwen3" in s.MODEL_NAME.lower()) and ("fused" in s.MODEL_NAME.lower())
+        use_fused = bool(getattr(s, "MOE_FUSED_ENABLE", False)) and ("qwen3" in s.MODEL_NAME.lower()) and ("fused" in s.MODEL_NAME.lower())
 
         if use_fused:
             logger.info(f"Loading fused Qwen3 MoE model '{s.MODEL_NAME}' (device_map='{s.DEVICE_MAP}')")
             try:
-                # Import only when needed to keep the base install minimal
                 from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
-                # If you decide to use 4-bit fused repos, you can also patch bitsandbytes quantizer:
-                # from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
-                # patch_bnb_quantizer()
+            except Exception as e:
+                raise RuntimeError(
+                    "MOE_FUSED_ENABLE=true but qwen3_moe_fused is not importable. "
+                    "Install it first, e.g.:\n"
+                    "  pip install -U pip setuptools wheel\n"
+                    "  sudo apt-get update && sudo apt-get install -y git  # ensure git is available\n"
+                    "  pip install -r requirements-moe.txt\n"
+                    "Or: pip install \"transformers-qwen3-moe-fused @ git+https://github.com/woct0rdho/transformers-qwen3-moe-fused@4caa1524b8f691d24da2fa26e99711b2ec77db44\""
+                ) from e
 
-                # The fused class generally doesn't take attn_implementation kwarg;
-                # so we avoid passing it here.
+            try:
                 model = Qwen3MoeFusedForCausalLM.from_pretrained(
                     s.MODEL_NAME,
                     **init_kwargs,
