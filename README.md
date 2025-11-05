@@ -7,18 +7,6 @@ FastAPI server for vocabulary‑constrained text generation using Hugging Face T
 - Constraints: trie → regex with lm‑format‑enforcer
 - Auth: simple bearer token or `?token=...` query param
 
-## Contents
-
-- Quickstart
-- Configuration (environment variables)
-- Endpoints
-  - GET /v1/models
-  - POST /v1/chat/completions (request/response examples)
-- Constrained vocabulary (how it works, how to enable)
-- Batching (clear, step‑by‑step guide with examples)
-- Operational and performance tips
-- Troubleshooting
-
 ---
 
 ## Quickstart
@@ -58,54 +46,6 @@ curl -H "Authorization: Bearer <your-secret-token>" http://127.0.0.1:8010/v1/mod
 ```
 
 If you didn’t change it, the default token is `changeme` (don’t use this in production).
-
----
-
-## Configuration
-
-All configuration is environment‑driven (loaded via `.env`). Key settings and safe defaults:
-
-```dotenv
-# Auth
-SECRET_TOKEN=changeme          # REQUIRED in production (use a strong value)
-
-# Model/runtime
-MODEL_NAME=google/gemma-3-27b-it
-TRUST_REMOTE_CODE=false        # set true only for trusted model repos
-TORCH_DTYPE=bf16               # "auto", "bf16", or "fp16"
-DEVICE_MAP=auto                # transformers dispatch (can shard/offload)
-
-# Attention implementation: sdpa | flash_attention_2 | eager
-ATTN_IMPLEMENTATION=sdpa
-
-# Tokenization/padding
-TOKENIZER_PADDING_SIDE=left
-PAD_TO_MULTIPLE_OF=16          # 8 or 16 is a good default; 64 can over‑pad
-MAX_INPUT_TOKENS=512
-ALLOWED_MAX_NEW_TOKENS=64,128,256,512
-
-# Optional optimization
-STATIC_KV_CACHE=false          # enable only if measured faster on your HW
-
-# Constrained vocab prebuild (optional)
-PREBUILD_PREFIX=true
-PREBUILD_WORD_COUNTS=3000
-PREBUILD_LANGS=es
-WORDLIST_DIR=wordlists
-
-# Batch jobs
-BATCH_JOB_PIPELINE_SIZE=8
-# BATCH_JOB_TEMP_DIR=/tmp      # defaults to OS temp dir
-
-# Logging
-LOG_LEVEL=INFO
-```
-
-Notes:
-- Keep `TOKENIZER_PADDING_SIDE=left` for decoder‑only models and batching.
-- Prefer `PAD_TO_MULTIPLE_OF=8` or `16` unless you measure a benefit with `64`.
-- `STATIC_KV_CACHE` can improve throughput on some setups if memory allows.
-- If `TRUST_REMOTE_CODE=true`, ensure the model repo is trusted.
 
 ---
 
@@ -366,38 +306,5 @@ Implementation details:
 - Uploaded files are stored in `BATCH_JOB_TEMP_DIR` (defaults to OS temp) and removed after processing.
 - The output file remains available for download after completion (path is tracked in memory).
 - `BATCH_JOB_PIPELINE_SIZE` controls how many prompts the pipeline feeds per forward pass.
-
----
-
-## Operational and performance tips
-
-- Beam search: `num_beams=10` is high‑quality but slow. For lower latency, try `num_beams=1–4`.
-- Inputs: keep `MAX_INPUT_TOKENS` realistic; longer prompts increase prefill cost.
-- Padding: left padding pairs well with KV cache schemes and batching. Use `PAD_TO_MULTIPLE_OF=8` or `16` unless measured otherwise.
-- Static KV cache: only enable if you’ve measured throughput gains and have VRAM headroom.
-- Security: keep `TRUST_REMOTE_CODE=false` unless you control the model repo; use a strong `SECRET_TOKEN`.
-
----
-
-## Troubleshooting
-
-- 403 Forbidden:
-  - Missing or incorrect token. Pass `Authorization: Bearer ...` header or `?token=...`.
-- 404 on batch results:
-  - Wrong `job_id` or the job hasn’t completed yet (check status first).
-- Job failed (batch):
-  - Check `error` in `/v1/batch/jobs/{job_id}`. Common causes: invalid JSON file (must be a JSON list), missing wordlist for `vocab_lang`, or OOM on large batches.
-- Slow responses:
-  - Reduce `num_beams`, lower `max_tokens`, or lower `BATCH_JOB_PIPELINE_SIZE` if you see GPU OOM.
-- Device offload:
-  - With large models, `DEVICE_MAP=auto` may offload to CPU and increase latency. Consider quantization (4‑bit) and/or different hardware.
-
----
-
-## Development notes
-
-- Auth helper accepts either `Authorization: Bearer <token>` or `?token=<token>`.
-- Startup optionally prebuilds constrained vocab prefix functions for configured languages and word counts.
-- Batch status is in‑memory per process. If you run multiple workers, stick to one worker for batch routes or swap to a shared store (e.g., Redis) for production.
 
 ---
