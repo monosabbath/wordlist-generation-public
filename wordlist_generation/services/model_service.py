@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -48,31 +49,59 @@ class ModelService:
         if dtype != "auto":
             init_kwargs["torch_dtype"] = dtype
 
-        logger.info(
-            f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
-            f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
-        )
+        # Optional Triton autotuning logs for fused kernels
+        if s.MOE_FUSED_TRITON_AUTOTUNING:
+            os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                attn_implementation=s.ATTN_IMPLEMENTATION,
-                **init_kwargs,
-            )
-        except TypeError:
-            logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                **init_kwargs,
+        model = None
+        tokenizer = None
+
+        use_fused = bool(s.MOE_FUSED_ENABLE) and ("qwen3" in s.MODEL_NAME.lower()) and ("fused" in s.MODEL_NAME.lower())
+
+        if use_fused:
+            logger.info(f"Loading fused Qwen3 MoE model '{s.MODEL_NAME}' (device_map='{s.DEVICE_MAP}')")
+            try:
+                # Import only when needed to keep the base install minimal
+                from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
+                # If you decide to use 4-bit fused repos, you can also patch bitsandbytes quantizer:
+                # from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
+                # patch_bnb_quantizer()
+
+                # The fused class generally doesn't take attn_implementation kwarg;
+                # so we avoid passing it here.
+                model = Qwen3MoeFusedForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    **init_kwargs,
+                )
+            except Exception as e:
+                logger.error(f"Failed to load fused MoE model '{s.MODEL_NAME}': {e}. Falling back to AutoModel.")
+                use_fused = False
+
+        if not use_fused:
+            logger.info(
+                f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
+                f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
             )
             try:
-                model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
-            except Exception as e:
-                logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    **init_kwargs,
+                )
+            except TypeError:
+                logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    **init_kwargs,
+                )
                 try:
-                    model.set_attention_implementation("sdpa")
-                except Exception as e2:
-                    logger.warning(f"Could not set SDPA either: {e2}")
+                    model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
+                except Exception as e:
+                    logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
+                    try:
+                        model.set_attention_implementation("sdpa")
+                    except Exception as e2:
+                        logger.warning(f"Could not set SDPA either: {e2}")
 
         if s.STATIC_KV_CACHE:
             try:
