@@ -15,3 +15,5 @@ class ChatCompletionRequest(BaseModel):
     vocab_n_words: Optional[int] = None
     num_beams: Optional[int] = 10
     length_penalty: Optional[float] = 1.0
+    # Request OpenAI-compatible SSE streaming when true
+    stream: Optional[bool] = False
