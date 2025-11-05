@@ -58,18 +58,15 @@ class ModelService:
             f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
         )
 
-        # Inspect config first so we can route Mistral3 correctly
+        # Inspect config to route Mistral3 correctly
         cfg = AutoConfig.from_pretrained(s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False)
         model_type = getattr(cfg, "model_type", "").lower()
         cfg_name = cfg.__class__.__name__
 
-        model = None
+        # Load model
         if model_type == "mistral3" or "Mistral3Config" in cfg_name:
-            # Use the explicit class for Mistral 3.x models
             try:
-                # Requires transformers >= 4.46.x where this class is available
                 from transformers import Mistral3ForConditionalGeneration  # type: ignore
-
                 try:
                     model = Mistral3ForConditionalGeneration.from_pretrained(
                         s.MODEL_NAME,
@@ -77,7 +74,6 @@ class ModelService:
                         **init_kwargs,
                     )
                 except TypeError:
-                    # Some builds don't accept attn_implementation in from_pretrained
                     logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
                     model = Mistral3ForConditionalGeneration.from_pretrained(
                         s.MODEL_NAME,
@@ -92,13 +88,11 @@ class ModelService:
                         except Exception as e3:
                             logger.warning(f"Could not set SDPA either: {e3}")
             except ImportError as e:
-                # Clear guidance to upgrade Transformers for Mistral3 support
                 raise RuntimeError(
-                    "Transformers build does not expose Mistral3ForConditionalGeneration. "
-                    "Please upgrade: pip install -U 'transformers>=4.46.0' 'mistral-common>=1.6.2'"
+                    "Your Transformers version does not expose Mistral3ForConditionalGeneration. "
+                    "Please upgrade: pip install -U 'transformers>=4.46.2' 'mistral-common>=1.6.2'"
                 ) from e
         else:
-            # Default path for decoder-only models that map to AutoModelForCausalLM
             try:
                 model = AutoModelForCausalLM.from_pretrained(
                     s.MODEL_NAME,
@@ -120,16 +114,32 @@ class ModelService:
                     except Exception as e2:
                         logger.warning(f"Could not set SDPA either: {e2}")
 
-        if s.STATIC_KV_CACHE:
-            try:
-                model.generation_config.cache_implementation = "static"
-                logger.info("Enabled static KV cache.")
-            except Exception as e:
-                logger.warning(f"Static KV cache not available: {e}")
+        # Load tokenizer with Mistral3 fallback
+        tokenizer = None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                s.MODEL_NAME,
+                trust_remote_code=s.TRUST_REMOTE_CODE,
+                local_files_only=False,
+            )
+        except KeyError as e:
+            # Example: KeyError: <class '...Mistral3Config'>
+            if model_type == "mistral3" or "Mistral3Config" in str(e):
+                try:
+                    from transformers import Mistral3Tokenizer  # type: ignore
+                except ImportError as e2:
+                    raise RuntimeError(
+                        "Transformers build does not expose Mistral3Tokenizer. "
+                        "Upgrade with: pip install -U 'transformers>=4.46.2' 'tokenizers>=0.20.1'"
+                    ) from e2
+                tokenizer = Mistral3Tokenizer.from_pretrained(
+                    s.MODEL_NAME,
+                    trust_remote_code=s.TRUST_REMOTE_CODE,
+                    local_files_only=False,
+                )
+            else:
+                raise
 
-        tokenizer = AutoTokenizer.from_pretrained(
-            s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False
-        )
         tokenizer.padding_side = s.TOKENIZER_PADDING_SIDE
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
