@@ -57,9 +57,6 @@ uv run uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers
 curl -H "Authorization: Bearer <your-secret-token>" http://127.0.0.1:8010/v1/models
 ```
 
-Notes
-- We removed `torch` from default dependencies so installs don’t touch the preinstalled Runpod torch.
-- `fastapi[standard]` was narrowed to `fastapi` to avoid pulling large optional packages you don’t need.
 - Optional extras:
   - `.[gpu-quant]` adds `bitsandbytes` and `compressed-tensors`.
   - `.[torch]` is available if you ever install on an environment that doesn’t already have PyTorch.
