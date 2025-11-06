@@ -1,6 +1,6 @@
 # Wordlist‑Constrained Generation Server
 
-FastAPI server for vocabulary‑constrained text generation using Hugging Face Transformers and lm‑format‑enforcer. It exposes an OpenAI‑compatible chat completions endpoint and a simple batch job system. The code is modular for readability and maintainability.
+FastAPI server for vocabulary‑constrained text generation using Hugging Face Transformers and lm‑format‑enforcer. It exposes an OpenAI‑compatible chat completions endpoint and a simple batch job system.
 
 ---
 
