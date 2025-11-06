@@ -4,45 +4,22 @@ FastAPI server for vocabulary‑constrained text generation using Hugging Face T
 
 ---
 
-# Quickstart (Runpod + uv, reusing preinstalled PyTorch)
+# Quickstart
 
-This setup reuses the PyTorch 2.4.0 that ships with the Runpod image, uses uv for faster installs, and persists wheel caches so subsequent installs are much faster.
-
-1) Install uv and create a venv that can see the system packages (so it reuses torch)
+1) Install uv and create a venv
 
 ```bash
 pip install --upgrade uv
-uv venv --python 3.11 --system-site-packages .venv
+uv venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-Verify torch comes from the base image (should print 2.4.0 and a system path):
+2) Install the project with uv (fast resolver/installer)
 
 ```bash
-python -c "import torch,sys; print('torch', torch.__version__, 'from', torch.__file__); print('venv', sys.prefix)"
-```
-
-2) Persist caches for wheels (uv and pip)
-
-```bash
-# Use a persistent location on Runpod (e.g., /workspace)
-mkdir -p /workspace/.cache/uv /workspace/.cache/pip
-
-# Point uv and pip to the persistent caches
-export UV_CACHE_DIR=/workspace/.cache/uv
-pip config set global.cache-dir /workspace/.cache/pip
-```
-
-Tip: add the `export UV_CACHE_DIR=...` line to your shell profile (e.g., `~/.bashrc`) so it’s set on new sessions.
-
-3) Install the project with uv (fast resolver/installer)
-
-```bash
-# Standard install (reuses system torch, does NOT download torch)
 uv pip install -e .
 
 # uv pip install -e ".[gpu-quant]"
-# uv pip install -e ".[torch]"
 ```
 
 4) Run the server
