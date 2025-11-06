@@ -7,12 +7,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 logger = logging.getLogger("model-service")
 
 
+class GPUConcurrencyGate:
+    """
+    Simple process-local concurrency gate to avoid overlapping GPU-bound generation
+    when running a single sharded model with device_map='auto'.
+    """
+    def __init__(self, max_concurrency: int = 1):
+        import threading
+        # A semaphore of size N allows up to N concurrent generations.
+        self._sem = threading.Semaphore(max_concurrency)
+
+    def __enter__(self):
+        self._sem.acquire()
+
+    def __exit__(self, exc_type, exc, tb):
+        self._sem.release()
+
+
 class ModelService:
     def __init__(self, model, tokenizer, text_pipeline, settings):
         self.model = model
         self.tokenizer = tokenizer
         self.text_pipeline = text_pipeline
         self.settings = settings
+        # Serialize GPU work by default (can be >1 if you want limited parallelism)
+        self.gpu_gate = GPUConcurrencyGate(max_concurrency=int(getattr(settings, "GENERATION_MAX_CONCURRENCY", 1)))
 
     @property
     def is_cohere_reasoning_model(self) -> bool:
