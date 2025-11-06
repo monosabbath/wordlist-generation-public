@@ -4,37 +4,65 @@ FastAPI server for vocabulary‑constrained text generation using Hugging Face T
 
 ---
 
-## Quickstart
+# Quickstart (Runpod + uv, reusing preinstalled PyTorch)
 
-1) Create a virtual environment:
+This setup reuses the PyTorch 2.4.0 that ships with the Runpod image, uses uv for faster installs, and persists wheel caches so subsequent installs are much faster.
+
+1) Install uv and create a venv that can see the system packages (so it reuses torch)
 
 ```bash
-python -m venv .venv
+pip install --upgrade uv
+uv venv --python 3.11 --system-site-packages .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-2) Install:
+Verify torch comes from the base image (should print 2.4.0 and a system path):
 
 ```bash
-pip install -e .
+python -c "import torch,sys; print('torch', torch.__version__, 'from', torch.__file__); print('venv', sys.prefix)"
 ```
 
-3) Place any wordlists (e.g., `es.txt`) in the `wordlists/` directory. The repo includes `wordlists/es.txt` as an example.
-
-4) Run the server:
+2) Persist caches for wheels (uv and pip)
 
 ```bash
-uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
+# Use a persistent location on Runpod (e.g., /workspace)
+mkdir -p /workspace/.cache/uv /workspace/.cache/pip
+
+# Point uv and pip to the persistent caches
+export UV_CACHE_DIR=/workspace/.cache/uv
+pip config set global.cache-dir /workspace/.cache/pip
 ```
 
-5) Test authentication:
+Tip: add the `export UV_CACHE_DIR=...` line to your shell profile (e.g., `~/.bashrc`) so it’s set on new sessions.
+
+3) Install the project with uv (fast resolver/installer)
+
+```bash
+# Standard install (reuses system torch, does NOT download torch)
+uv pip install -e .
+
+# If you need GPU quantization/compression:
+# uv pip install -e ".[gpu-quant]"
+```
+
+4) Run the server
+
+```bash
+uv run uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
+```
+
+5) Test authentication
 
 ```bash
 curl -H "Authorization: Bearer <your-secret-token>" http://127.0.0.1:8010/v1/models
 ```
 
-If you didn’t change it, the default token is `changeme` (don’t use this in production).
-
+Notes
+- We removed `torch` from default dependencies so installs don’t touch the preinstalled Runpod torch.
+- `fastapi[standard]` was narrowed to `fastapi` to avoid pulling large optional packages you don’t need.
+- Optional extras:
+  - `.[gpu-quant]` adds `bitsandbytes` and `compressed-tensors`.
+  - `.[torch]` is available if you ever install on an environment that doesn’t already have PyTorch.
 ---
 
 ## Endpoints
