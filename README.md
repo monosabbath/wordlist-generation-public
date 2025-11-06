@@ -14,7 +14,7 @@ uv venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 ```
 
-2) Install the project with uv (fast resolver/installer)
+2) Install the project with uv
 
 ```bash
 uv pip install -e .
