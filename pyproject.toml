@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2",
     "python-dotenv",
     "safetensors",
+    "torch",
     "transformers>=4.46.2,<5.0.0",
     "tokenizers>=0.20.1",
     # Tokenizers/libs commonly used by models
@@ -23,9 +24,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Torch is preinstalled on Runpod; only opt-in if installing elsewhere.
-torch = ["torch>=2.4,<2.5"]
-
 # Optional GPU quantization/compression
 gpu-quant = [
     "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
