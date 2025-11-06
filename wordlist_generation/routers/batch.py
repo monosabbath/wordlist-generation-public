@@ -13,7 +13,7 @@ def create_batch_job(
     file: UploadFile = File(...),
     auth_ok: bool = Depends(verify_token),
     max_tokens: int = 512,
-    num_beams: int = 10,
+    num_beams: int = 5,
     length_penalty: float = 1.0,
     vocab_lang: str | None = None,
     vocab_n_words: int | None = None,
