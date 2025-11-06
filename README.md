@@ -18,8 +18,6 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 
 ```bash
 uv pip install -e .
-
-# uv pip install -e ".[gpu-quant]"
 ```
 
 3) Run the server
