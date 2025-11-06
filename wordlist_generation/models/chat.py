@@ -13,5 +13,5 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     vocab_lang: Optional[str] = None
     vocab_n_words: Optional[int] = None
-    num_beams: Optional[int] = 10
+    num_beams: Optional[int] = 5
     length_penalty: Optional[float] = 1.0
