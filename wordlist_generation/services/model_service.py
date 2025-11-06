@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 
 logger = logging.getLogger("model-service")
 
@@ -47,6 +47,24 @@ class ModelService:
         }
         if dtype != "auto":
             init_kwargs["torch_dtype"] = dtype
+
+        # Enable 4-bit NF4 quantization automatically for *-bnb-nf4 models
+        if "bnb" in s.MODEL_NAME.lower():
+            # Prefer bf16 compute if available; otherwise use fp16
+            compute_dtype = torch.bfloat16 if (dtype == torch.bfloat16 or dtype == "auto") else torch.float16
+            try:
+                quant_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                )
+                init_kwargs["quantization_config"] = quant_config
+                # Avoid passing an explicit torch_dtype alongside 4-bit quant to prevent conflicts
+                init_kwargs.pop("torch_dtype", None)
+                logger.info("Enabled 4-bit NF4 quantization via bitsandbytes for bnb model.")
+            except Exception as e:
+                logger.warning(f"Could not configure 4-bit quantization: {e}")
 
         logger.info(
             f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
