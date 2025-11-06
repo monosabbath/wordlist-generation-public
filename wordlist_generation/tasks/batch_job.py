@@ -105,9 +105,10 @@ def process_batch_job(
             else:
                 raise ValueError(f"Constrained vocabulary config failed for lang '{vocab_lang}'.")
 
-        # 4. Run generation
+        # 4. Run generation (serialized via model_service.gpu_gate)
         logger.info(f"[Job {job_id}] Running generation...")
         results: List[str] = []
+
         if model_service.is_cohere_reasoning_model:
             # Cohere path: build tokenized inputs via chat template (batched)
             encoded_list = []
@@ -132,8 +133,9 @@ def process_batch_job(
             batch = strip_unused_model_inputs(batch)
             batch = move_inputs_to_correct_device(batch, model)
 
-            with torch.inference_mode():
-                outputs = model.generate(**batch, **generation_kwargs)
+            with model_service.gpu_gate:
+                with torch.inference_mode():
+                    outputs = model.generate(**batch, **generation_kwargs)
 
             bsz = outputs.size(0)
             for i in range(bsz):
@@ -151,18 +153,19 @@ def process_batch_job(
                     text = text + "<think></think>"
                 prompts.append(text)
 
-            for output in model_service.text_pipeline(
-                prompts,
-                batch_size=settings.BATCH_JOB_PIPELINE_SIZE,
-                return_full_text=False,
-                padding=True,
-                truncation=True,
-                pad_to_multiple_of=settings.PAD_TO_MULTIPLE_OF,
-                max_length=settings.MAX_INPUT_TOKENS,
-                **generation_kwargs,
-            ):
-                # Each output is a list of sequences per prompt (usually 1)
-                results.append(output[0]["generated_text"])
+            with model_service.gpu_gate:
+                for output in model_service.text_pipeline(
+                    prompts,
+                    batch_size=settings.BATCH_JOB_PIPELINE_SIZE,
+                    return_full_text=False,
+                    padding=True,
+                    truncation=True,
+                    pad_to_multiple_of=settings.PAD_TO_MULTIPLE_OF,
+                    max_length=settings.MAX_INPUT_TOKENS,
+                    **generation_kwargs,
+                ):
+                    # Each output is a list of sequences per prompt (usually 1)
+                    results.append(output[0]["generated_text"])
 
         # 5. Save output file
         logger.info(f"[Job {job_id}] Formatting and saving results...")
@@ -244,6 +247,7 @@ def enqueue_batch_job(
         "config": job_config,
     }
 
+    # Keep BackgroundTasks but actual GPU-bound work will be serialized by the gate
     background_tasks.add_task(
         process_batch_job, job_id, input_path, output_path, job_config, settings, model_service
     )
