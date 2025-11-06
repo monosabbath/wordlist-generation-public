@@ -22,7 +22,7 @@ uv pip install -e .
 # uv pip install -e ".[gpu-quant]"
 ```
 
-4) Run the server
+3) Run the server
 
 ```bash
 uv run uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
