@@ -7,25 +7,28 @@ requires-python = ">=3.11, <3.13"
 
 dependencies = [
     "accelerate>=0.32.0",
-    "fastapi[standard]",
+    "fastapi",
     "httpx",
     "lm-format-enforcer>=0.11.2",
     "pydantic>=2",
     "python-dotenv",
     "safetensors",
-    "torch",
-    # Mistral 3.x support stack
     "transformers>=4.46.2,<5.0.0",
     "tokenizers>=0.20.1",
-    "huggingface_hub>=0.24.6",
-    "mistral-common>=1.6.2",
-    # Optional GPU quant + compression
-    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "compressed-tensors",
-    # Tokenizers used by some models
+    # Tokenizers/libs commonly used by models
     "tiktoken",
     "sentencepiece",
+    # Server
     "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+# Torch is preinstalled on Runpod; only opt-in if installing elsewhere.
+torch = ["torch>=2.4,<2.5"]
+
+# Optional GPU quantization/compression
+gpu-quant = [
+    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
 [dependency-groups]
