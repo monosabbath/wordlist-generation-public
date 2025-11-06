@@ -11,7 +11,7 @@ FastAPI server for vocabulary‑constrained text generation using Hugging Face T
 ```bash
 pip install --upgrade uv
 uv venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 ```
 
 2) Install the project with uv
