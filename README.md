@@ -41,8 +41,8 @@ Tip: add the `export UV_CACHE_DIR=...` line to your shell profile (e.g., `~/.bas
 # Standard install (reuses system torch, does NOT download torch)
 uv pip install -e .
 
-# If you need GPU quantization/compression:
 # uv pip install -e ".[gpu-quant]"
+# uv pip install -e ".[torch]"
 ```
 
 4) Run the server
@@ -51,15 +51,6 @@ uv pip install -e .
 uv run uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
 ```
 
-5) Test authentication
-
-```bash
-curl -H "Authorization: Bearer <your-secret-token>" http://127.0.0.1:8010/v1/models
-```
-
-- Optional extras:
-  - `.[gpu-quant]` adds `bitsandbytes` and `compressed-tensors`.
-  - `.[torch]` is available if you ever install on an environment that doesn’t already have PyTorch.
 ---
 
 ## Endpoints
