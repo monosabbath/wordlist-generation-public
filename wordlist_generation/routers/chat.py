@@ -102,8 +102,9 @@ def chat_completions(req: ChatCompletionRequest, request: Request, auth_ok: bool
         prefix_fn=prefix_fn,
     )
 
-    with torch.inference_mode():
-        outputs = model.generate(**inputs, **gen_kwargs)
+    with ms.gpu_gate:  # serialize GPU-bound generation
+        with torch.inference_mode():
+            outputs = model.generate(**inputs, **gen_kwargs)
 
     gen_len = int(outputs[0].shape[0] - input_len)
     last_token = int(outputs[0][-1].item())
