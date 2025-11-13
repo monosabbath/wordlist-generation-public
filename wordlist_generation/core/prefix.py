@@ -9,26 +9,24 @@ from .tokens import get_stop_ids, get_cohere_control_ids
 # -----------------------------------------------------------------------------
 # This module builds constrained-vocabulary prefix functions for LMFE.
 #
-# Key changes vs. previous version:
-# - Uses a simplified grammar that avoids duplicating the large "word" alternation:
+# Key changes:
+# - Simplified grammar that avoids duplicating the large "word" alternation:
 #     flexible_grammar = (?:punct)?(?:word punct)*
 #   This:
 #     * Allows optional leading punctuation/whitespace
 #     * Requires any word to be followed by punctuation/whitespace (so outputs do not end in a word)
-#     * Allows empty and punctuation-only outputs (as discussed and acceptable)
+#     * Allows empty and punctuation-only outputs (acceptable per spec)
 #     * Uses the "word" alternation exactly once to reduce RegexParser compile time
 #
-# - Adds bucketization: splits the word set into multiple smaller regexes/parsers and
+# - Bucketization: splits the word set into multiple smaller regexes/parsers and
 #   unions their allowed tokens at runtime. This drastically cuts RegexParser build time
 #   for thousands of words at the cost of a small per-step overhead.
 #
-# - EOS handling remains unchanged: we still union stop_ids so EOS is allowed at any time,
-#   per the current setup and your preference.
+# - EOS handling remains unchanged: we still union stop_ids so EOS is allowed at any time.
 #
-# Tunables (env overrides):
-#   LMFE_PUNCT_CLASS            - character class for separators (default: [.,;:!?¿¡…\\s]+)
-#   LMFE_BUCKET_MAX_WORDS       - max words per compiled regex bucket (default: 200)
-#   LMFE_USE_BUCKETS_MIN_WORDS  - if n_words >= this, use bucketization (default: 400)
+# Configuration:
+# - Punctuation class is configured here in-code via PUNCT_REGEX.
+# - Bucketization thresholds remain configurable via env (LMFE_BUCKET_MAX_WORDS, LMFE_USE_BUCKETS_MIN_WORDS).
 # -----------------------------------------------------------------------------
 
 
@@ -133,13 +131,18 @@ def _prefix_cache_key(tokenizer, lang: str, n_words: int, wordlist_dir: str, all
     return (name, eos, n_words, f"{wordlist_dir}:{lang}", allow_cohere_controls)
 
 
-# -------------------------- Bucketization helpers ----------------------------
+# -------------------------- Configuration constants --------------------------
 
-# Tunables via environment
-_PUNCT_CLASS = os.getenv("LMFE_PUNCT_CLASS", r"[.,;:!?¿¡…\s]+")
+# Configure punctuation/whitespace separators here (no env override).
+# Keep this set as small as you can tolerate for faster RegexParser builds.
+PUNCT_REGEX = r"[.,;:!?¿¡…\s]+"
+
+# Bucketization tunables via environment (leave as-is for flexibility).
 _BUCKET_MAX_WORDS_DEFAULT = int(os.getenv("LMFE_BUCKET_MAX_WORDS", "200"))
 _USE_BUCKETS_MIN_WORDS = int(os.getenv("LMFE_USE_BUCKETS_MIN_WORDS", "400"))
 
+
+# -------------------------- Bucketization helpers ----------------------------
 
 def _count_words_under(node: _TrieNode, nlimit: int, cache: Dict[int, int]) -> int:
     """
@@ -356,7 +359,7 @@ def build_regexp_prefix_fn(
     if trie.min_rank > n_words:
         return None
 
-    punct_regex = _PUNCT_CLASS
+    punct_regex = PUNCT_REGEX
     bucket_max_words = _BUCKET_MAX_WORDS_DEFAULT
 
     # Use bucketization for larger n to avoid multi-minute RegexParser builds
