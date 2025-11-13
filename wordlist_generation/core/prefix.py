@@ -40,14 +40,45 @@ def escapefor_regex(ch: str) -> str:
 
 
 def trieto_regex(node: _TrieNode, nlimit: int) -> str:
-    alts = []
+    # Group children by their recursive subpattern
+    grouped: Dict[str, List[str]] = {}
     for ch, child in sorted(node.children.items()):
         if child.min_rank > nlimit:
             continue
         sub = trieto_regex(child, nlimit)
-        alts.append(escapefor_regex(ch) + sub)
-    if node.end and node.min_rank <= nlimit:
+        grouped.setdefault(sub, []).append(ch)
+
+    has_end = node.end and node.min_rank <= nlimit
+
+    # Special-case: pure terminal set (all children have empty suffix)
+    if grouped and set(grouped.keys()) == {""}:
+        chars = "".join(re.escape(c) for c in grouped[""])
+        if has_end:
+            # Set plus optional termination
+            return f"[{chars}]?"
+        else:
+            return f"[{chars}]"
+
+    alts: List[str] = []
+
+    # Build alternatives with suffix factoring
+    for sub, chars in grouped.items():
+        if len(chars) == 1:
+            # Single char: escape and concatenate directly
+            alts.append(re.escape(chars[0]) + sub)
+        else:
+            # Multiple chars share the same suffix; build a character class
+            cls = "".join(re.escape(c) for c in chars)
+            if sub == "":
+                alts.append(f"[{cls}]")
+            else:
+                # Concatenation of the class and the suffix pattern
+                alts.append(f"[{cls}]{sub}")
+
+    # Handle end-of-word (empty alternative)
+    if has_end:
         alts.append("")
+
     if not alts:
         return ""
     if len(alts) == 1:
