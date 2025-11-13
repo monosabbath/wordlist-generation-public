@@ -135,7 +135,7 @@ def _prefix_cache_key(tokenizer, lang: str, n_words: int, wordlist_dir: str, all
 
 # Configure punctuation/whitespace separators here (no env override).
 # Keep this set as small as you can tolerate for faster RegexParser builds.
-PUNCT_REGEX = r"[.,;:!?¿¡…\s]+"
+PUNCT_REGEX = r"[.,!?¿¡…\s]+"
 
 # Bucketization tunables via environment (leave as-is for flexibility).
 _BUCKET_MAX_WORDS_DEFAULT = int(os.getenv("LMFE_BUCKET_MAX_WORDS", "200"))
