@@ -23,7 +23,7 @@ uv pip install -e .
 3) Run the server
 
 ```bash
-uv run uvicorn wordlist_generation.main:app --host 0.0.0.0 --port 8010 --workers 1
+uv run uvicorn wordlist_generation.app.main:app --host 0.0.0.0 --port 8010 --workers 1
 ```
 
 ---
