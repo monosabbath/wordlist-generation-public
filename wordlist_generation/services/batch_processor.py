@@ -82,11 +82,17 @@ class BatchProcessor:
             max_new_tokens = normalize_max_new_tokens(job_config.get("max_tokens", 512), self.settings.ALLOWED_MAX_NEW_TOKENS)
             generation_kwargs = dict(
                 max_new_tokens=max_new_tokens,
-                do_sample=False,
+                # Enable sampling with beam search
+                do_sample=True,
                 num_beams=job_config.get("num_beams", 10),
                 length_penalty=job_config.get("length_penalty", 1.0),
                 eos_token_id=stop_ids,
                 pad_token_id=tokenizer.pad_token_id,
+                # Sampling params
+                temperature=float(job_config.get("temperature", 1.0)),
+                top_p=float(job_config.get("top_p", 1.0)),
+                top_k=int(job_config.get("top_k", 50)),
+                repetition_penalty=float(job_config.get("repetition_penalty", 1.0)),
             )
 
             # Constrained vocab prefix
@@ -221,6 +227,11 @@ class BatchProcessor:
         length_penalty: float,
         vocab_lang: str | None,
         vocab_n_words: int | None,
+        # Sampling params
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repetition_penalty: float,
     ):
         job_id = str(uuid.uuid4())
         input_path = os.path.join(self.settings.BATCH_JOB_TEMP_DIR, f"{job_id}_input.json")
@@ -238,6 +249,11 @@ class BatchProcessor:
             "length_penalty": length_penalty,
             "vocab_lang": vocab_lang,
             "vocab_n_words": vocab_n_words,
+            # Sampling params
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "repetition_penalty": repetition_penalty,
         }
 
         self.job_status[job_id] = {
