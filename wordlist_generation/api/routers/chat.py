@@ -103,6 +103,11 @@ def chat_completions(req: ChatCompletionRequest, request: Request, auth_ok: bool
         num_beams=req.num_beams,
         length_penalty=req.length_penalty if req.length_penalty is not None else 1.0,
         prefix_fn=prefix_fn,
+        # Sampling params
+        temperature=req.temperature,
+        top_p=req.top_p,
+        top_k=req.top_k,
+        repetition_penalty=req.repetition_penalty,
     )
 
     with ms.gpu_gate:  # serialize GPU-bound generation
