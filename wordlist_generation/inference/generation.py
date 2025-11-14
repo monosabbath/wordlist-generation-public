@@ -75,13 +75,28 @@ def getgen_kwargs(
     num_beams: Optional[int] = None,
     length_penalty: float = 1.0,
     prefix_fn=None,
+    # Sampling parameters
+    temperature: Optional[float] = None,
+    top_p: Optional[float] = None,
+    top_k: Optional[int] = None,
+    repetition_penalty: Optional[float] = None,
 ):
+    # Defaults for sampling params when not provided
+    t = float(temperature if temperature is not None else 1.0)
+    tp = float(top_p if top_p is not None else 1.0)
+    tk = int(top_k if top_k is not None else 50)
+    rp = float(repetition_penalty if repetition_penalty is not None else 1.0)
+
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        do_sample=False,
-        # Consider lowering default beams to 1-4 for latency; 10 is very slow.
+        # Enable sampling together with beam search
+        do_sample=True,
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
+        temperature=t,
+        top_p=tp,
+        top_k=tk,
+        repetition_penalty=rp,
     )
     if prefix_fn:
         gen_kwargs["prefix_allowed_tokens_fn"] = prefix_fn
