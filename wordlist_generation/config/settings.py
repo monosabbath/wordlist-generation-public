@@ -32,13 +32,18 @@ class Settings:
     )
     STATIC_KV_CACHE: bool = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
-    # Grouped GEMM / MoE optimization flags
-    # USE_GROUPED_GEMM: enable optimization and expose fuse_experts() flow
-    # LOAD_FUSED_EXPERTS: checkpoint already saved after fuse_experts()
-    # FUSE_ON_CPU_BEFORE_SHARD: force CPU load then fuse, then shard to GPUs
+    # Grouped GEMM / MoE optimization
     USE_GROUPED_GEMM: bool = os.getenv("USE_GROUPED_GEMM", "false").lower() == "true"
     LOAD_FUSED_EXPERTS: bool = os.getenv("LOAD_FUSED_EXPERTS", "false").lower() == "true"
-    FUSE_ON_CPU_BEFORE_SHARD: bool = os.getenv("FUSE_ON_CPU_BEFORE_SHARD", "false").lower() == "true"
+    # Force CPU-first load, fuse on CPU, then shard (prevents cuda:0 allocations during fusion)
+    FUSE_ON_CPU_BEFORE_SHARD: bool = os.getenv("FUSE_ON_CPU_BEFORE_SHARD", "true").lower() == "true"
+
+    # Multi-GPU sharding controls
+    # Optional per-GPU and CPU max memory hints for auto device mapping (e.g., "gpu0:70GiB,gpu1:70GiB,cpu:256GiB")
+    GPU_MAX_MEMORY: str | None = os.getenv("GPU_MAX_MEMORY") or None
+    CPU_MAX_MEMORY: str | None = os.getenv("CPU_MAX_MEMORY") or None
+    # Where to offload tensors if needed during dispatch
+    OFFLOAD_DIR: str = os.getenv("OFFLOAD_DIR", ".offload")
 
     # Constrained vocab
     PREBUILD_PREFIX: bool = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
