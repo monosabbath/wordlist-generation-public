@@ -24,7 +24,7 @@ dependencies = [
     # Server
     "uvicorn>=0.30.0",
     # Grouped GEMM optimization
-    "grouped_gemm @ git+https://github.com/fanshiqing/grouped_gemm@main",
+    "nv-grouped-gemm @ git+https://github.com/fanshiqing/grouped_gemm@main",
 ]
 
 [dependency-groups]
