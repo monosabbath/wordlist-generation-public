@@ -49,3 +49,7 @@ class Settings:
 
     # In-process GPU generation concurrency (1 = fully serialized)
     GENERATION_MAX_CONCURRENCY: int = int(os.getenv("GENERATION_MAX_CONCURRENCY", "1"))
+
+    # Deepseek V3 MoE grouped GEMM optimization
+    USE_GROUPED_GEMM: bool = os.getenv("USE_GROUPED_GEMM", "false").lower() == "true"
+    FUSE_EXPERTS_ON_STARTUP: bool = os.getenv("FUSE_EXPERTS_ON_STARTUP", "true").lower() == "true"

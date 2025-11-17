@@ -37,6 +37,12 @@ class ModelService:
     def is_cohere_reasoning_model(self) -> bool:
         return self.settings.MODEL_NAME.strip().lower() == "coherelabs/command-a-reasoning-08-2025"
 
+    @staticmethod
+    def is_deepseek_v3_model(model_name: str) -> bool:
+        """Check if the model is a Deepseek V3 MoE model."""
+        normalized = model_name.strip().lower()
+        return "deepseek-v3" in normalized or "deepseek_v3" in normalized
+
     @classmethod
     def from_settings(cls, s):
         # Torch backend knobs
@@ -99,6 +105,36 @@ class ModelService:
                 logger.info("Enabled static KV cache.")
             except Exception as e:
                 logger.warning(f"Static KV cache not available: {e}")
+
+        # Deepseek V3 MoE grouped GEMM optimization
+        if ModelService.is_deepseek_v3_model(s.MODEL_NAME) and s.USE_GROUPED_GEMM:
+            logger.info("Deepseek V3 model detected with USE_GROUPED_GEMM=true")
+            
+            # Check if grouped_gemm is available
+            try:
+                import grouped_gemm  # noqa: F401
+                logger.info("grouped_gemm module found")
+            except ImportError:
+                logger.error(
+                    "grouped_gemm module not found. To use grouped GEMM optimization for Deepseek V3, "
+                    "please install it: pip install grouped_gemm"
+                )
+                logger.warning("Continuing without grouped GEMM optimization")
+            else:
+                # Fuse experts if requested
+                if s.FUSE_EXPERTS_ON_STARTUP:
+                    try:
+                        logger.info("Calling model.fuse_experts() to enable grouped GEMM kernel...")
+                        model.fuse_experts()
+                        logger.info("Successfully fused experts for Deepseek V3 MoE model")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to fuse experts for Deepseek V3 model: {e}. "
+                            "Falling back to standard MoE implementation."
+                        )
+                else:
+                    logger.info("FUSE_EXPERTS_ON_STARTUP=false, skipping expert fusion")
+
 
         tokenizer = AutoTokenizer.from_pretrained(
             s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False

@@ -148,6 +148,50 @@ Wordlist guidance:
 
 ---
 
+## Deepseek V3 MoE Support
+
+The server supports running Deepseek V3 Mixture-of-Experts (MoE) models with the grouped GEMM optimization introduced in Hugging Face Transformers. This optimization can significantly improve inference performance for Deepseek V3 models.
+
+### Setup
+
+1) Install the optional `grouped_gemm` dependency:
+
+```bash
+pip install grouped_gemm
+```
+
+2) Configure your `.env` file for Deepseek V3:
+
+```bash
+MODEL_NAME=deepseek-ai/DeepSeek-V3
+USE_GROUPED_GEMM=true
+FUSE_EXPERTS_ON_STARTUP=true
+TORCH_DTYPE=bf16
+TRUST_REMOTE_CODE=true
+DEVICE_MAP=auto
+```
+
+### Configuration Options
+
+- **`USE_GROUPED_GEMM`** (default: `false`): Enable grouped GEMM optimization for Deepseek V3 models. When `true`, the server will attempt to use the optimized MoE kernel.
+
+- **`FUSE_EXPERTS_ON_STARTUP`** (default: `true`): When `USE_GROUPED_GEMM=true`, controls whether the server calls `model.fuse_experts()` at startup to switch to the grouped GEMM implementation. This is a one-time operation that happens during model loading.
+
+### Behavior
+
+- The server automatically detects Deepseek V3 models (via substring match on the model name).
+- If `USE_GROUPED_GEMM=true` but `grouped_gemm` is not installed, the server logs a clear error and continues with the standard MoE implementation.
+- If expert fusion fails for any reason, the server logs an error and falls back to the standard implementation.
+- For non-Deepseek V3 models, these settings have no effect.
+
+### Requirements
+
+- Transformers version: `>=4.46.2,<5.0.0` (as specified in `pyproject.toml`)
+- Optional: `grouped_gemm` package (only required when `USE_GROUPED_GEMM=true`)
+- Compatible GPU hardware for optimal performance
+
+---
+
 ## Batching
 
 The batch system lets you upload a list of chat completion requests as a JSON file. The server processes them in the background and provides a downloadable results file.
