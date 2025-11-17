@@ -1,129 +1,133 @@
 #!/usr/bin/env python3
 """
-Upload a (fused) checkpoint folder to the Hugging Face Hub.
-
-- Loads .env (HUGGINGFACE_HUB_TOKEN / HF_TOKEN)
-- Uses upload_large_folder() when available and selected, else falls back to upload_folder()
-- Version-agnostic import for HfHubHTTPError
-- Resumable uploads if your huggingface_hub is recent enough
+Upload large model folders to Hugging Face Hub.
 
 Usage:
-  python wordlist_generation/scripts/upload_to_hf.py \
-      --repo_id <user>/<repo> \
-      --folder_path /path/to/fused-model \
-      --private \
-      --force-large \
-      --num-workers 12
+  python upload_to_hf.py \
+      --repo_id your-username/model-name \
+      --folder_path ./your-model-folder \
+      --private
 """
 import argparse
 import os
+import sys
+import math
 from pathlib import Path
-
 from dotenv import load_dotenv, find_dotenv
+from huggingface_hub import HfApi
 
-# Robust imports across huggingface_hub versions
-try:
-    from huggingface_hub import HfApi, create_repo, upload_folder, upload_large_folder  # type: ignore
-    HAS_TOPLEVEL_LARGE = True
-except Exception:
-    from huggingface_hub import HfApi, create_repo, upload_folder  # type: ignore
-    HAS_TOPLEVEL_LARGE = False
+REQUIRED_FILES = ["config.json", "tokenizer_config.json"]
+WEIGHT_PATTERNS = ["model.safetensors", "model-00001-of-", "pytorch_model.bin"]
 
-# HfHubHTTPError import compatibility
-try:
-    from huggingface_hub import HfHubHTTPError  # new-style
-except Exception:
-    try:
-        from huggingface_hub.utils._errors import HfHubHTTPError  # older versions
-    except Exception:
-        class HfHubHTTPError(Exception):  # fallback
-            pass
+def human_size(num_bytes: int) -> str:
+    if num_bytes <= 0:
+        return "0B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    p = int(math.floor(math.log(num_bytes, 1024)))
+    return f"{num_bytes / (1024**p):.2f}{units[p]}"
 
+def scan_folder(folder: Path):
+    total = 0
+    count = 0
+    for p in folder.rglob("*"):
+        if p.is_file():
+            total += p.stat().st_size
+            count += 1
+    return total, count
+
+def validate_folder(folder: Path):
+    """Basic validation that this looks like a model folder"""
+    missing = [f for f in REQUIRED_FILES if not (folder / f).exists()]
+    
+    # Check for at least one weight file
+    has_weights = any(
+        (folder / pattern).exists() or 
+        any(f.name.startswith(pattern) for f in folder.iterdir() if f.is_file())
+        for pattern in WEIGHT_PATTERNS
+    )
+    
+    if missing:
+        print(f"[warn] Missing recommended files: {', '.join(missing)}")
+    if not has_weights:
+        print("[warn] No weight files found (safetensors/bin)")
+    
+    print("[validate] Folder structure looks okay")
 
 def main():
     load_dotenv(find_dotenv(usecwd=True), override=False)
-
+    
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo_id", required=True, help="e.g. username/fused-model")
-    ap.add_argument("--folder_path", required=True, help="Local folder to upload")
-    ap.add_argument("--private", action="store_true", help="Create repo as private")
-    ap.add_argument("--commit_message", default="Upload fused checkpoint")
-    ap.add_argument("--repo_type", choices=["model", "dataset", "space"], default="model")
-    ap.add_argument("--token", default=None, help="HF token (overrides env). If omitted, uses env.")
-    ap.add_argument("--force-large", action="store_true", help="Force resumable upload_large_folder() when available")
-    ap.add_argument("--num-workers", type=int, default=12, help="Workers for large upload")
+    ap.add_argument("--repo_id", required=True, help="HF repo id: username/model-name")
+    ap.add_argument("--folder_path", required=True, help="Local model folder")
+    ap.add_argument("--private", action="store_true", help="Create private repo")
+    ap.add_argument("--token", default=None, help="HF token (or set HF_TOKEN env var)")
+    ap.add_argument("--num-workers", type=int, default=12, help="Upload workers")
+    ap.add_argument("--use-large-if-over-gb", type=float, default=5.0)
+    ap.add_argument("--force-large", action="store_true", help="Force large upload method")
+    ap.add_argument("--dry-run", action="store_true", help="Don't upload, just validate")
     args = ap.parse_args()
-
-    # Resolve token precedence: CLI > HUGGINGFACE_HUB_TOKEN > HF_TOKEN
-    env_token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
-    token = args.token or env_token
-
-    if token:
-        print("[upload] Using token from CLI/env.")
-    else:
-        print("[upload] WARNING: No token provided. Private repos will fail.")
-
+    
+    # Get folder
     folder = Path(args.folder_path).expanduser().resolve()
-    if not folder.exists() or not folder.is_dir():
-        raise SystemExit(f"[upload] Folder does not exist or is not a directory: {folder}")
-
-    print(f"[upload] Folder: {folder}")
-    print(f"[upload] Target: {args.repo_id} (type={args.repo_type}, private={args.private})")
-
+    if not folder.is_dir():
+        print(f"[error] Not a folder: {folder}")
+        sys.exit(1)
+    
+    # Get token
+    token = args.token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if not token:
+        print("[error] No HF token found. Set HF_TOKEN env var or use --token")
+        sys.exit(1)
+    
+    # Scan folder
+    total_bytes, file_count = scan_folder(folder)
+    size_gb = total_bytes / (1024**3)
+    print(f"[scan] {file_count} files, {human_size(total_bytes)} ({size_gb:.2f} GB)")
+    
+    # Validate
+    validate_folder(folder)
+    
+    if args.dry_run:
+        print("[dry-run] Stopping before upload")
+        return
+    
+    # Determine upload method
+    use_large = args.force_large or (size_gb > args.use_large_if_over_gb)
+    
     api = HfApi(token=token)
-
-    # Create repo if needed
+    
+    # Create repo
+    print(f"[repo] Creating/verifying: {args.repo_id}")
     try:
-        create_repo(
+        api.create_repo(
             repo_id=args.repo_id,
             private=args.private,
-            repo_type=args.repo_type,
             exist_ok=True,
-            token=token,
         )
-        print(f"[upload] Repo is ready: https://huggingface.co/{args.repo_id}")
-    except HfHubHTTPError as e:
-        print(f"[upload] Failed to create/verify repo: {e}")
-        raise
-
-    # Decide upload method
-    can_large = HAS_TOPLEVEL_LARGE or hasattr(api, "upload_large_folder")
-    if args.force_large and not can_large:
-        print("[upload] WARNING: upload_large_folder() not available in your huggingface_hub version.")
-        print("         Run: pip install -U 'huggingface_hub>=0.32.0'")
-    use_large = args.force_large and can_large
-
+        print(f"[repo] ✓ https://huggingface.co/{args.repo_id}")
+    except Exception as e:
+        print(f"[error] Failed to create repo: {e}")
+        sys.exit(1)
+    
+    # Upload
     if use_large:
-        print(f"[upload] Starting resumable large upload with {args.num_workers} workers...")
-        # Call either top-level or instance method depending on availability
-        if HAS_TOPLEVEL_LARGE:
-            upload_large_folder(
-                repo_id=args.repo_id,
-                repo_type=args.repo_type,
-                folder_path=str(folder),
-                num_workers=args.num_workers,
-                token=token,
-            )
-        else:
-            api.upload_large_folder(  # type: ignore[attr-defined]
-                repo_id=args.repo_id,
-                repo_type=args.repo_type,
-                folder_path=str(folder),
-                num_workers=args.num_workers,
-                token=token,
-            )
-    else:
-        print("[upload] Starting single-commit upload...")
-        upload_folder(
+        print(f"[upload] Starting LARGE upload ({args.num_workers} workers)...")
+        print("[upload] This is resumable - you can Ctrl+C and restart")
+        api.upload_large_folder(
             repo_id=args.repo_id,
-            repo_type=args.repo_type,
             folder_path=str(folder),
-            commit_message=args.commit_message,
-            token=token,
+            num_workers=args.num_workers,
         )
-
-    print("[upload] Upload complete: https://huggingface.co/{args.repo_id}")
-
+    else:
+        print("[upload] Starting standard upload...")
+        api.upload_folder(
+            repo_id=args.repo_id,
+            folder_path=str(folder),
+            commit_message="Upload model",
+        )
+    
+    print("[done] ✓ Upload complete!")
+    print(f"[done] View at: https://huggingface.co/{args.repo_id}")
 
 if __name__ == "__main__":
     main()
