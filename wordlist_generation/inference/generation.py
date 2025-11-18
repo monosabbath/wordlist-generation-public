@@ -3,11 +3,24 @@ import torch
 
 
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
+    """
+    Safe device movement:
+    - If model is sharded across multiple GPUs (hf_device_map has >1 distinct devices),
+      leave inputs as-is (usually on CPU). Accelerate / generate() will handle transfers.
+    - Otherwise move to the single model device.
+    """
     try:
+        device_map = getattr(model, "hf_device_map", None)
+        if isinstance(device_map, dict):
+            unique_devices = {str(v) for v in device_map.values()}
+            if len(unique_devices) > 1:
+                # Multi-device sharded: do NOT force move
+                return inputs
         device = next(model.parameters()).device
-    except StopIteration:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return {k: v.to(device) for k, v in inputs.items()}
+        return {k: v.to(device) for k, v in inputs.items()}
+    except Exception:
+        # Fallback: return unchanged
+        return inputs
 
 
 def tokenizer_encode_for_chat(tokenizer, texts: Any, pad_to_multiple_of: int, max_input_tokens: int) -> Dict[str, torch.Tensor]:
@@ -29,12 +42,10 @@ def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torc
 
 
 def normalize_max_new_tokens(requested: Optional[int], allowed: Optional[tuple[int, ...]]) -> int:
-    # Use the configured allowed set to determine the cap; fall back to 512 if not provided.
     if not allowed or len(allowed) == 0:
         cap = 512
         target = int(requested) if requested is not None else cap
         return min(target, cap)
-    # allowed is sorted in Settings; use its max as cap
     cap = allowed[-1]
     target = int(requested) if requested is not None else cap
     target = min(target, cap)
@@ -75,13 +86,11 @@ def getgen_kwargs(
     num_beams: Optional[int] = None,
     length_penalty: float = 1.0,
     prefix_fn=None,
-    # Sampling parameters
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repetition_penalty: Optional[float] = None,
 ):
-    # Defaults for sampling params when not provided
     t = float(temperature if temperature is not None else 1.0)
     tp = float(top_p if top_p is not None else 1.0)
     tk = int(top_k if top_k is not None else 50)
@@ -89,7 +98,6 @@ def getgen_kwargs(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        # Enable sampling together with beam search
         do_sample=True,
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
