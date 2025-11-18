@@ -4,22 +4,30 @@ import torch
 
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
     """
-    Safe device movement:
-    - If model is sharded across multiple GPUs (hf_device_map has >1 distinct devices),
-      leave inputs as-is (usually on CPU). Accelerate / generate() will handle transfers.
-    - Otherwise move to the single model device.
+    Safe device handling:
+
+    - If the model is sharded across >1 devices (multi-GPU with hf_device_map), leave inputs on CPU.
+      Accelerate's dispatch_model expects CPU (or neutral) inputs and will route them efficiently.
+      Forcing them onto a single GPU can trigger implicit full-weight or buffer copies -> OOM.
+
+    - If the model is on exactly one device, move inputs there.
     """
     try:
         device_map = getattr(model, "hf_device_map", None)
         if isinstance(device_map, dict):
             unique_devices = {str(v) for v in device_map.values()}
+            # Multi-device: keep on CPU
             if len(unique_devices) > 1:
-                # Multi-device sharded: do NOT force move
-                return inputs
+                return inputs  # no move
+            # Single-device sharded map case (rare but possible)
+            sole = list(unique_devices)[0]
+            if "cuda" in sole or "cpu" in sole:
+                dev = torch.device(sole)
+                return {k: v.to(dev) for k, v in inputs.items()}
+        # Fallback: model has parameters on a single device
         device = next(model.parameters()).device
         return {k: v.to(device) for k, v in inputs.items()}
     except Exception:
-        # Fallback: return unchanged
         return inputs
 
 
@@ -59,14 +67,12 @@ def truncate_inputs_to_max_length(inputs: Dict[str, torch.Tensor], max_length: i
     input_ids = inputs["input_ids"]
     attn = inputs.get("attention_mask")
     if input_ids.dim() == 1:
-        length = input_ids.size(0)
-        if length > max_length:
+        if input_ids.size(0) > max_length:
             input_ids = input_ids[-max_length:]
             if attn is not None:
                 attn = attn[-max_length:]
     elif input_ids.dim() == 2:
-        bsz, seqlen = input_ids.size()
-        if seqlen > max_length:
+        if input_ids.size(1) > max_length:
             input_ids = input_ids[:, -max_length:]
             if attn is not None:
                 attn = attn[:, -max_length:]
@@ -98,7 +104,7 @@ def getgen_kwargs(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        do_sample=True,
+        do_sample=True,  # (Leave as-is; you asked not to change beam search config)
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
         temperature=t,
