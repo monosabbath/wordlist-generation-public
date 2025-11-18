@@ -39,7 +39,7 @@ class ModelService:
         except Exception:
             pass
 
-        # Dtype selection
+        # Dtype
         dtype: Any = "auto"
         ts = s.TORCH_DTYPE.lower()
         if ts in ("bf16", "bfloat16", "torch.bfloat16"):
@@ -68,7 +68,7 @@ class ModelService:
             f"device_map='{s.DEVICE_MAP}', use_grouped_gemm={use_grouped_gemm}, prefused={load_fused_experts})"
         )
 
-        # Load config
+        # Config
         config: Optional[AutoConfig] = None
         try:
             config = AutoConfig.from_pretrained(
@@ -80,9 +80,9 @@ class ModelService:
         if config and use_grouped_gemm and load_fused_experts and hasattr(config, "use_grouped_gemm"):
             try:
                 config.use_grouped_gemm = True
-                logger.info("Set config.use_grouped_gemm=True (prefused checkpoint).")
+                logger.info("Set config.use_grouped_gemm=True (prefused).")
             except Exception as e:
-                logger.warning(f"Could not set use_grouped_gemm on config: {e}")
+                logger.warning(f"Could not set use_grouped_gemm: {e}")
 
         attn_impl = getattr(s, "ATTN_IMPLEMENTATION", None)
 
@@ -102,7 +102,7 @@ class ModelService:
                         **{k: v for k, v in base_init.items() if k != "attn_implementation"},
                     )
             except TypeError:
-                logger.warning("Retrying load without attn_implementation (not supported).")
+                logger.warning("Retrying load without attn_implementation.")
                 if config is not None:
                     return AutoModelForCausalLM.from_pretrained(
                         s.MODEL_NAME,
@@ -117,16 +117,16 @@ class ModelService:
 
         model = _load_model()
 
-        # In-process fusion (only if not prefused)
+        # In-process fusion if unfused
         if use_grouped_gemm and not load_fused_experts and hasattr(model, "fuse_experts"):
             try:
-                logger.info("Fusing experts in-process on CPU...")
+                logger.info("Fusing experts on CPU...")
                 model.fuse_experts()
                 if hasattr(model.config, "use_grouped_gemm"):
                     model.config.use_grouped_gemm = True
-                logger.info("Expert fusion complete.")
+                logger.info("Fusion complete.")
             except Exception as e:
-                logger.error(f"Failed to fuse experts: {e}")
+                logger.error(f"Expert fusion failed: {e}")
 
         if s.STATIC_KV_CACHE:
             try:
@@ -142,56 +142,16 @@ class ModelService:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Parse max memory env
-        def _parse_max_memory(mm: str) -> Dict[str, str]:
-            out: Dict[str, str] = {}
-            if not mm:
-                return out
-            for part in mm.split(","):
-                part = part.strip()
-                if not part or "=" not in part:
-                    continue
-                k, v = part.split("=", 1)
-                k = k.strip()
-                v = v.strip()
-                if k and v:
-                    out[k] = v
-            return out
-
-        max_memory_map = _parse_max_memory(getattr(s, "MAX_MEMORY", ""))
-        if max_memory_map:
-            logger.info(f"Parsed max_memory: {max_memory_map}")
-        else:
-            logger.info("No MAX_MEMORY mapping provided; Accelerate will decide automatically.")
-
-        # Parse no-split classes
-        no_split = [c.strip() for c in getattr(s, "NO_SPLIT_MODULE_CLASSES", "").split(",") if c.strip()]
-        if no_split:
-            logger.info(f"No-split module classes: {no_split}")
-
         # Shard after CPU load
         if s.CPU_FIRST_LOAD:
-            logger.info("CPU-first load complete. Running device dispatch...")
+            logger.info("CPU-first load complete. Dispatching to devices (auto)...")
             if s.DEVICE_MAP == "auto":
                 try:
                     from accelerate.utils import infer_auto_device_map
                     from accelerate import dispatch_model
-
-                    device_map = infer_auto_device_map(
-                        model,
-                        max_memory=max_memory_map if max_memory_map else None,
-                        no_split_module_classes=no_split if no_split else None,
-                    )
-                    logger.info(f"Inferred device_map ({len(device_map)} entries): {device_map}")
+                    device_map = infer_auto_device_map(model)
+                    logger.info(f"Inferred device_map ({len(device_map)} entries).")
                     model = dispatch_model(model, device_map=device_map)
-                    # Report per-device parameter counts
-                    param_sizes: Dict[str, int] = {}
-                    for name, p in model.named_parameters():
-                        dev = str(p.device)
-                        param_sizes[dev] = param_sizes.get(dev, 0) + p.numel()
-                    for dev, cnt in sorted(param_sizes.items()):
-                        gb = cnt * p.element_size() / (1024**3)
-                        logger.info(f"Device {dev}: params={cnt:,} approx_mem={gb:.2f} GB (dtype element_size={p.element_size()})")
                 except Exception as e:
                     logger.warning(f"Automatic device sharding failed; model remains on CPU: {e}")
             elif s.DEVICE_MAP and s.DEVICE_MAP != "none":
@@ -199,9 +159,9 @@ class ModelService:
                     logger.info(f"Moving model to device '{s.DEVICE_MAP}'")
                     model.to(s.DEVICE_MAP)
                 except Exception as e:
-                    logger.warning(f"Failed to move model to '{s.DEVICE_MAP}': {e}")
+                    logger.warning(f"Failed to move model: {e}")
         else:
-            logger.info("Device map applied during from_pretrained (not CPU-first path).")
+            logger.info("Device map applied during initial load (not CPU-first).")
 
         model.eval()
 
