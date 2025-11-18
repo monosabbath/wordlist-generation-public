@@ -3,50 +3,67 @@ import os
 import torch
 
 
+def is_model_parallel(model) -> bool:
+    try:
+        devs = {p.device for p in model.parameters()}
+        cuda_devs = {d for d in devs if d.type == "cuda"}
+        return len(cuda_devs) > 1
+    except Exception:
+        return False
+
+
 def _local_rank_device() -> Optional[torch.device]:
     try:
         if torch.cuda.is_available():
             lr = os.getenv("LOCAL_RANK")
-            if lr is not None and lr.isdigit():
+            if lr and lr.isdigit():
                 return torch.device(f"cuda:{int(lr)}")
-            # fallback to current
             return torch.device(torch.cuda.current_device())
     except Exception:
         pass
     return None
 
 
-def _model_primary_device(model) -> torch.device:
-    """
-    Best-effort way to pick the correct "entry" device for inputs.
-    FSDP2 note: prefer LOCAL_RANK cuda device when available.
-    - Prefer LOCAL_RANK CUDA device if present (FSDP2 multi-process).
-    - Else input embedding weight device if available
-    - Else first parameter device
-    - Else CUDA:0 if available; else CPU
-    """
-    # Prefer local-rank device when running under torchrun (FSDP2)
-    lr_dev = _local_rank_device()
-    if lr_dev is not None:
-        return lr_dev
-
+def _embedding_device(model) -> Optional[torch.device]:
     try:
-        emb = getattr(model, "get_input_embeddings", None)
-        if callable(emb):
-            emb_mod = emb()
-            if emb_mod is not None:
-                p = next(emb_mod.parameters(), None)
-                if p is not None:
-                    return p.device
+        emb_fn = getattr(model, "get_input_embeddings", None)
+        if callable(emb_fn):
+            emb = emb_fn()
+            p = next(emb.parameters(), None)
+            if p is not None:
+                return p.device
     except Exception:
         pass
     try:
         return next(model.parameters()).device
     except StopIteration:
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return None
+
+
+def _model_primary_device(model) -> torch.device:
+    lr_dev = _local_rank_device()
+    if lr_dev is not None and not is_model_parallel(model):
+        return lr_dev
+    emb_dev = _embedding_device(model)
+    if emb_dev is not None:
+        return emb_dev
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
+    """
+    For model-parallel dispatch: keep inputs on CPU.
+    For single-device: move everything to that device.
+    """
+    if is_model_parallel(model):
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in inputs.items():
+            if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                out[k] = v.to("cpu")
+            else:
+                out[k] = v
+        return out
+
     device = _model_primary_device(model)
     out: Dict[str, torch.Tensor] = {}
     for k, v in inputs.items():
@@ -76,12 +93,10 @@ def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torc
 
 
 def normalize_max_new_tokens(requested: Optional[int], allowed: Optional[tuple[int, ...]]) -> int:
-    # Use the configured allowed set to determine the cap; fall back to 512 if not provided.
     if not allowed or len(allowed) == 0:
         cap = 512
         target = int(requested) if requested is not None else cap
         return min(target, cap)
-    # allowed is sorted in Settings; use its max as cap
     cap = allowed[-1]
     target = int(requested) if requested is not None else cap
     target = min(target, cap)
@@ -101,7 +116,7 @@ def truncate_inputs_to_max_length(inputs: Dict[str, torch.Tensor], max_length: i
             if attn is not None:
                 attn = attn[-max_length:]
     elif input_ids.dim() == 2:
-        bsz, seqlen = input_ids.size()
+        _, seqlen = input_ids.size()
         if seqlen > max_length:
             input_ids = input_ids[:, -max_length:]
             if attn is not None:
@@ -122,13 +137,11 @@ def getgen_kwargs(
     num_beams: Optional[int] = None,
     length_penalty: float = 1.0,
     prefix_fn=None,
-    # Sampling parameters
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repetition_penalty: Optional[float] = None,
 ):
-    # Defaults for sampling params when not provided
     t = float(temperature if temperature is not None else 1.0)
     tp = float(top_p if top_p is not None else 1.0)
     tk = int(top_k if top_k is not None else 50)
@@ -136,7 +149,6 @@ def getgen_kwargs(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        # Enable sampling together with beam search
         do_sample=True,
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
@@ -152,5 +164,5 @@ def getgen_kwargs(
         if tokenizer.pad_token_id is not None:
             gen_kwargs["pad_token_id"] = tokenizer.pad_token_id
         else:
-            gen_kwargs["pad_token_id"] = stop_ids[0] if isinstance(stop_ids, list) and stop_ids else None
+            gen_kwargs["pad_token_id"] = stop_ids[0] if stop_ids else None
     return gen_kwargs
