@@ -8,6 +8,10 @@ logger = logging.getLogger("model-service")
 
 
 class GPUConcurrencyGate:
+    """
+    Simple process-local concurrency gate to avoid overlapping GPU-bound generation
+    when running a single sharded model with device_map='auto'.
+    """
     def __init__(self, max_concurrency: int = 1):
         import threading
         self._sem = threading.Semaphore(max_concurrency)
@@ -33,13 +37,14 @@ class ModelService:
 
     @classmethod
     def from_settings(cls, s):
+        # Torch backend knobs
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
             torch.backends.cudnn.allow_tf32 = True
         except Exception:
             pass
 
-        # Dtype
+        # Dtype selection
         dtype: Any = "auto"
         ts = s.TORCH_DTYPE.lower()
         if ts in ("bf16", "bfloat16", "torch.bfloat16"):
@@ -55,21 +60,30 @@ class ModelService:
             "trust_remote_code": s.TRUST_REMOTE_CODE,
             "low_cpu_mem_usage": True,
             "local_files_only": False,
-            "device_map": None if s.CPU_FIRST_LOAD else (s.DEVICE_MAP if s.DEVICE_MAP != "none" else None),
         }
         if dtype != "auto":
             base_init["torch_dtype"] = dtype
 
+        # Grouped GEMM / MoE flags
         use_grouped_gemm = bool(getattr(s, "USE_GROUPED_GEMM", False))
         load_fused_experts = bool(getattr(s, "LOAD_FUSED_EXPERTS", False))
+        # IMPORTANT: Honor CPU-first whenever requested, even for pre-fused checkpoints
+        fuse_on_cpu_before_shard = bool(getattr(s, "FUSE_ON_CPU_BEFORE_SHARD", False))
+
+        # If cpu_first is requested, force initial CPU load (no device_map). We'll dispatch to GPUs afterward.
+        cpu_first = bool(fuse_on_cpu_before_shard)
+
+        device_map_to_use: Optional[str] = None if cpu_first else s.DEVICE_MAP
 
         logger.info(
-            f"Loading model '{s.MODEL_NAME}' (cpu_first={s.CPU_FIRST_LOAD}, "
-            f"device_map='{s.DEVICE_MAP}', use_grouped_gemm={use_grouped_gemm}, prefused={load_fused_experts})"
+            f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
+            f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{device_map_to_use}', "
+            f"use_grouped_gemm={use_grouped_gemm}, load_fused_experts={load_fused_experts}, "
+            f"cpu_first={cpu_first})"
         )
 
-        # Config
-        config: Optional[AutoConfig] = None
+        # Load config first to possibly set use_grouped_gemm for pre-fused checkpoints
+        config = None
         try:
             config = AutoConfig.from_pretrained(
                 s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False
@@ -77,57 +91,56 @@ class ModelService:
         except Exception as e:
             logger.warning(f"Failed to load config first: {e}")
 
+        # If using a pre-fused checkpoint, set config.use_grouped_gemm=True for runtime kernels
         if config and use_grouped_gemm and load_fused_experts and hasattr(config, "use_grouped_gemm"):
             try:
                 config.use_grouped_gemm = True
-                logger.info("Set config.use_grouped_gemm=True (prefused).")
+                logger.info("Set config.use_grouped_gemm=True (pre-fused checkpoint).")
             except Exception as e:
-                logger.warning(f"Could not set use_grouped_gemm: {e}")
+                logger.warning(f"Could not set use_grouped_gemm on config: {e}")
 
-        attn_impl = getattr(s, "ATTN_IMPLEMENTATION", None)
+        # Model load (CPU-first if requested)
+        init_kwargs = dict(base_init)
+        if device_map_to_use is not None:
+            init_kwargs["device_map"] = device_map_to_use
 
-        def _load_model():
+        try:
+            if config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    config=config,
+                    **init_kwargs,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    **init_kwargs,
+                )
+        except TypeError:
+            logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+            if config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    config=config,
+                    **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                )
             try:
-                if config is not None:
-                    return AutoModelForCausalLM.from_pretrained(
-                        s.MODEL_NAME,
-                        attn_implementation=attn_impl,
-                        config=config,
-                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
-                    )
-                else:
-                    return AutoModelForCausalLM.from_pretrained(
-                        s.MODEL_NAME,
-                        attn_implementation=attn_impl,
-                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
-                    )
-            except TypeError:
-                logger.warning("Retrying load without attn_implementation.")
-                if config is not None:
-                    return AutoModelForCausalLM.from_pretrained(
-                        s.MODEL_NAME,
-                        config=config,
-                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
-                    )
-                else:
-                    return AutoModelForCausalLM.from_pretrained(
-                        s.MODEL_NAME,
-                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
-                    )
-
-        model = _load_model()
-
-        # In-process fusion if unfused
-        if use_grouped_gemm and not load_fused_experts and hasattr(model, "fuse_experts"):
-            try:
-                logger.info("Fusing experts on CPU...")
-                model.fuse_experts()
-                if hasattr(model.config, "use_grouped_gemm"):
-                    model.config.use_grouped_gemm = True
-                logger.info("Fusion complete.")
+                model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
             except Exception as e:
-                logger.error(f"Expert fusion failed: {e}")
+                logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
+                try:
+                    model.set_attention_implementation("sdpa")
+                except Exception as e2:
+                    logger.warning(f"Could not set SDPA either: {e2}")
 
+        # Optional: static KV cache
         if s.STATIC_KV_CACHE:
             try:
                 model.generation_config.cache_implementation = "static"
@@ -142,29 +155,42 @@ class ModelService:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Shard after CPU load
-        if s.CPU_FIRST_LOAD:
-            logger.info("CPU-first load complete. Dispatching to devices (auto)...")
-            if s.DEVICE_MAP == "auto":
+        # If not pre-fused and grouped_gemm requested, fuse on CPU prior to sharding (CPU-first workflow)
+        if use_grouped_gemm and not load_fused_experts:
+            if hasattr(model, "fuse_experts"):
                 try:
+                    logger.info("Fusing experts on CPU prior to sharding...")
+                    model.fuse_experts()
+                    logger.info("Expert fusion complete.")
+                except ImportError as e:
+                    logger.error(
+                        "Missing grouped_gemm. Install with: pip install git+https://github.com/fanshiqing/grouped_gemm@main"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to fuse experts: {e}")
+            else:
+                logger.warning("Model has no fuse_experts(); verify Transformers feature branch is installed.")
+
+        # If we loaded on CPU first and want multi-GPU, shard now using Accelerate
+        if cpu_first:
+            try:
+                if s.DEVICE_MAP == "auto" or s.DEVICE_MAP == "sequential" or not s.DEVICE_MAP:
                     from accelerate.utils import infer_auto_device_map
                     from accelerate import dispatch_model
+                    # Let Accelerate decide a balanced device map across GPUs
                     device_map = infer_auto_device_map(model)
-                    logger.info(f"Inferred device_map ({len(device_map)} entries).")
+                    logger.info(f"Inferred device_map for model-parallel dispatch: {device_map}")
                     model = dispatch_model(model, device_map=device_map)
-                except Exception as e:
-                    logger.warning(f"Automatic device sharding failed; model remains on CPU: {e}")
-            elif s.DEVICE_MAP and s.DEVICE_MAP != "none":
-                try:
-                    logger.info(f"Moving model to device '{s.DEVICE_MAP}'")
+                elif s.DEVICE_MAP and s.DEVICE_MAP != "auto":
+                    # If user provided a concrete device string, move whole model (single-device case)
+                    logger.info(f"Moving model to device '{s.DEVICE_MAP}' (single device).")
                     model.to(s.DEVICE_MAP)
-                except Exception as e:
-                    logger.warning(f"Failed to move model: {e}")
-        else:
-            logger.info("Device map applied during initial load (not CPU-first).")
+            except Exception as e:
+                logger.warning(f"Automatic device sharding failed; model remains on CPU: {e}")
 
         model.eval()
 
+        # Build a pipeline. For model-parallel (dispatched) models, don't force a device here.
         text_pipeline = pipeline(
             "text-generation",
             model=model,
