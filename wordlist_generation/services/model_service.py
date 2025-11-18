@@ -1,7 +1,8 @@
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, pipeline
 
 logger = logging.getLogger("model-service")
 
@@ -13,7 +14,6 @@ class GPUConcurrencyGate:
     """
     def __init__(self, max_concurrency: int = 1):
         import threading
-        # A semaphore of size N allows up to N concurrent generations.
         self._sem = threading.Semaphore(max_concurrency)
 
     def __enter__(self):
@@ -29,7 +29,6 @@ class ModelService:
         self.tokenizer = tokenizer
         self.text_pipeline = text_pipeline
         self.settings = settings
-        # Serialize GPU work by default (can be >1 if you want limited parallelism)
         self.gpu_gate = GPUConcurrencyGate(max_concurrency=int(getattr(settings, "GENERATION_MAX_CONCURRENCY", 1)))
 
     @property
@@ -57,40 +56,77 @@ class ModelService:
         else:
             logger.info("Using dtype: auto")
 
-        init_kwargs: Dict[str, Any] = {
+        base_init: Dict[str, Any] = {
             "trust_remote_code": s.TRUST_REMOTE_CODE,
             "low_cpu_mem_usage": True,
             "local_files_only": False,
-            "device_map": s.DEVICE_MAP,
         }
-        
         if dtype != "auto":
-            init_kwargs["torch_dtype"] = dtype
-        
-        # Add use_grouped_gemm if enabled (for fused checkpoints)
-        if s.USE_GROUPED_GEMM:
-            init_kwargs["use_grouped_gemm"] = True
-            logger.info("Grouped GEMM enabled for fused checkpoint")
+            base_init["torch_dtype"] = dtype
+
+        # Read MoE/grouped_gemm flags with safe defaults
+        use_grouped_gemm = bool(getattr(s, "USE_GROUPED_GEMM", False))
+        load_fused_experts = bool(getattr(s, "LOAD_FUSED_EXPERTS", False))
+        fuse_on_cpu_before_shard = bool(getattr(s, "FUSE_ON_CPU_BEFORE_SHARD", False))
+        cpu_first = bool(use_grouped_gemm and fuse_on_cpu_before_shard and not load_fused_experts)
+
+        device_map_to_use: Optional[str] = None if cpu_first else s.DEVICE_MAP
 
         logger.info(
             f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
-            f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}', "
-            f"use_grouped_gemm={s.USE_GROUPED_GEMM})"
+            f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{device_map_to_use}', "
+            f"use_grouped_gemm={use_grouped_gemm}, load_fused_experts={load_fused_experts}, "
+            f"cpu_first={cpu_first})"
         )
 
+        # Load config first to possibly set use_grouped_gemm for pre-fused checkpoints
+        config = None
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                attn_implementation=s.ATTN_IMPLEMENTATION,
-                **init_kwargs,
+            config = AutoConfig.from_pretrained(
+                s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False
             )
-        except TypeError as e:
-            logger.warning(f"Model.from_pretrained() raised TypeError: {e}. Retrying without attn_implementation.")
-            # Remove attn_implementation and retry
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                **init_kwargs,
-            )
+        except Exception as e:
+            logger.warning(f"Failed to load config first: {e}")
+
+        if config and use_grouped_gemm and load_fused_experts and hasattr(config, "use_grouped_gemm"):
+            try:
+                config.use_grouped_gemm = True
+                logger.info("Set config.use_grouped_gemm=True (pre-fused checkpoint).")
+            except Exception as e:
+                logger.warning(f"Could not set use_grouped_gemm on config: {e}")
+
+        # Model load
+        init_kwargs = dict(base_init)
+        if device_map_to_use is not None:
+            init_kwargs["device_map"] = device_map_to_use
+
+        try:
+            if config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    config=config,
+                    **init_kwargs,
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    **init_kwargs,
+                )
+        except TypeError:
+            logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+            if config is not None:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    config=config,
+                    **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                )
+            else:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                )
             try:
                 model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
             except Exception as e:
@@ -100,6 +136,7 @@ class ModelService:
                 except Exception as e2:
                     logger.warning(f"Could not set SDPA either: {e2}")
 
+        # Optional: static KV cache
         if s.STATIC_KV_CACHE:
             try:
                 model.generation_config.cache_implementation = "static"
@@ -113,6 +150,40 @@ class ModelService:
         tokenizer.padding_side = s.TOKENIZER_PADDING_SIDE
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        # Fuse experts on CPU if using unfused checkpoint
+        if use_grouped_gemm and not load_fused_experts:
+            if hasattr(model, "fuse_experts"):
+                try:
+                    logger.info("Fusing experts on CPU prior to sharding...")
+                    model.fuse_experts()
+                    logger.info("Expert fusion complete.")
+                except ImportError as e:
+                    logger.error(
+                        "Missing grouped_gemm. Install with: pip install git+https://github.com/fanshiqing/grouped_gemm@main"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to fuse experts: {e}")
+            else:
+                logger.warning("Model has no fuse_experts(); verify Transformers feature branch is installed.")
+
+        # If we loaded on CPU first and want multi-GPU, shard now
+        if cpu_first:
+            if s.DEVICE_MAP == "auto":
+                try:
+                    from accelerate.utils import infer_auto_device_map
+                    from accelerate import dispatch_model
+                    device_map = infer_auto_device_map(model)
+                    logger.info(f"Inferred device_map for fused model: {device_map}")
+                    model = dispatch_model(model, device_map=device_map)
+                except Exception as e:
+                    logger.warning(f"Automatic device sharding failed; model remains on CPU: {e}")
+            elif s.DEVICE_MAP and s.DEVICE_MAP != "auto":
+                try:
+                    logger.info(f"Moving fused model to device '{s.DEVICE_MAP}'")
+                    model.to(s.DEVICE_MAP)
+                except Exception as e:
+                    logger.warning(f"Failed to move fused model to '{s.DEVICE_MAP}': {e}")
 
         model.eval()
 
