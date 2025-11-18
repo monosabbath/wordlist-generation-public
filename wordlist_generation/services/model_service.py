@@ -55,7 +55,6 @@ class ModelService:
             "trust_remote_code": s.TRUST_REMOTE_CODE,
             "low_cpu_mem_usage": True,
             "local_files_only": False,
-            # Critical: no device_map here if CPU_FIRST_LOAD
             "device_map": None if s.CPU_FIRST_LOAD else (s.DEVICE_MAP if s.DEVICE_MAP != "none" else None),
         }
         if dtype != "auto":
@@ -66,11 +65,10 @@ class ModelService:
 
         logger.info(
             f"Loading model '{s.MODEL_NAME}' (cpu_first={s.CPU_FIRST_LOAD}, "
-            f"device_map='{s.DEVICE_MAP}', use_grouped_gemm={use_grouped_gemm}, "
-            f"prefused={load_fused_experts})"
+            f"device_map='{s.DEVICE_MAP}', use_grouped_gemm={use_grouped_gemm}, prefused={load_fused_experts})"
         )
 
-        # Load config first
+        # Load config
         config: Optional[AutoConfig] = None
         try:
             config = AutoConfig.from_pretrained(
@@ -86,8 +84,6 @@ class ModelService:
             except Exception as e:
                 logger.warning(f"Could not set use_grouped_gemm on config: {e}")
 
-        # Model load (always CPU if CPU_FIRST_LOAD)
-        init_kwargs = dict(base_init)
         attn_impl = getattr(s, "ATTN_IMPLEMENTATION", None)
 
         def _load_model():
@@ -97,13 +93,13 @@ class ModelService:
                         s.MODEL_NAME,
                         attn_implementation=attn_impl,
                         config=config,
-                        **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
                     )
                 else:
                     return AutoModelForCausalLM.from_pretrained(
                         s.MODEL_NAME,
                         attn_implementation=attn_impl,
-                        **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
                     )
             except TypeError:
                 logger.warning("Retrying load without attn_implementation (not supported).")
@@ -111,17 +107,17 @@ class ModelService:
                     return AutoModelForCausalLM.from_pretrained(
                         s.MODEL_NAME,
                         config=config,
-                        **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
                     )
                 else:
                     return AutoModelForCausalLM.from_pretrained(
                         s.MODEL_NAME,
-                        **{k: v for k, v in init_kwargs.items() if k != "attn_implementation"},
+                        **{k: v for k, v in base_init.items() if k != "attn_implementation"},
                     )
 
         model = _load_model()
 
-        # If unfused and using grouped_gemm, fuse on CPU now (offline fuse alternative)
+        # In-process fusion (only if not prefused)
         if use_grouped_gemm and not load_fused_experts and hasattr(model, "fuse_experts"):
             try:
                 logger.info("Fusing experts in-process on CPU...")
@@ -132,7 +128,6 @@ class ModelService:
             except Exception as e:
                 logger.error(f"Failed to fuse experts: {e}")
 
-        # Static KV cache toggle
         if s.STATIC_KV_CACHE:
             try:
                 model.generation_config.cache_implementation = "static"
@@ -147,31 +142,66 @@ class ModelService:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Dispatch to GPUs after CPU load
+        # Parse max memory env
+        def _parse_max_memory(mm: str) -> Dict[str, str]:
+            out: Dict[str, str] = {}
+            if not mm:
+                return out
+            for part in mm.split(","):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k and v:
+                    out[k] = v
+            return out
+
+        max_memory_map = _parse_max_memory(getattr(s, "MAX_MEMORY", ""))
+        if max_memory_map:
+            logger.info(f"Parsed max_memory: {max_memory_map}")
+        else:
+            logger.info("No MAX_MEMORY mapping provided; Accelerate will decide automatically.")
+
+        # Parse no-split classes
+        no_split = [c.strip() for c in getattr(s, "NO_SPLIT_MODULE_CLASSES", "").split(",") if c.strip()]
+        if no_split:
+            logger.info(f"No-split module classes: {no_split}")
+
+        # Shard after CPU load
         if s.CPU_FIRST_LOAD:
-            logger.info("CPU-first load complete. Preparing GPU dispatch...")
+            logger.info("CPU-first load complete. Running device dispatch...")
             if s.DEVICE_MAP == "auto":
                 try:
                     from accelerate.utils import infer_auto_device_map
                     from accelerate import dispatch_model
+
                     device_map = infer_auto_device_map(
                         model,
-                        max_memory=None,  # Could customize per-device memory
-                        no_split_module_classes=None,
+                        max_memory=max_memory_map if max_memory_map else None,
+                        no_split_module_classes=no_split if no_split else None,
                     )
-                    logger.info(f"Inferred device_map: {device_map}")
+                    logger.info(f"Inferred device_map ({len(device_map)} entries): {device_map}")
                     model = dispatch_model(model, device_map=device_map)
+                    # Report per-device parameter counts
+                    param_sizes: Dict[str, int] = {}
+                    for name, p in model.named_parameters():
+                        dev = str(p.device)
+                        param_sizes[dev] = param_sizes.get(dev, 0) + p.numel()
+                    for dev, cnt in sorted(param_sizes.items()):
+                        gb = cnt * p.element_size() / (1024**3)
+                        logger.info(f"Device {dev}: params={cnt:,} approx_mem={gb:.2f} GB (dtype element_size={p.element_size()})")
                 except Exception as e:
                     logger.warning(f"Automatic device sharding failed; model remains on CPU: {e}")
             elif s.DEVICE_MAP and s.DEVICE_MAP != "none":
-                # Single device or manual spec
                 try:
                     logger.info(f"Moving model to device '{s.DEVICE_MAP}'")
                     model.to(s.DEVICE_MAP)
                 except Exception as e:
                     logger.warning(f"Failed to move model to '{s.DEVICE_MAP}': {e}")
         else:
-            logger.info("Device map applied during from_pretrained (not CPU-first).")
+            logger.info("Device map applied during from_pretrained (not CPU-first path).")
 
         model.eval()
 
