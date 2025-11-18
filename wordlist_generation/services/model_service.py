@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Iterable, List, Optional
+from typing import Any, List, Dict
 
 import torch
 import torch.distributed as dist
@@ -10,10 +10,6 @@ logger = logging.getLogger("model-service")
 
 
 class GPUConcurrencyGate:
-    """
-    Process-local gate to avoid overlapping GPU-bound generation work.
-    Still useful per-rank with FSDP2.
-    """
     def __init__(self, max_concurrency: int = 1):
         import threading
         self._sem = threading.Semaphore(max_concurrency)
@@ -25,83 +21,77 @@ class GPUConcurrencyGate:
         self._sem.release()
 
 
-def _get_local_device() -> torch.device:
-    if torch.cuda.is_available():
-        # Prefer torch.distributed LOCAL_RANK if set
-        lr = os.getenv("LOCAL_RANK")
-        if lr is not None and lr.isdigit():
-            return torch.device(f"cuda:{int(lr)}")
-        # Else fall back to current
-        return torch.device(torch.cuda.current_device())
-    return torch.device("cpu")
-
-
-def _iter_named_modules(m) -> Iterable[tuple[str, torch.nn.Module]]:
-    for name, mod in m.named_modules():
-        yield name, mod
-
-
-def _discover_transformer_layers(model) -> List[torch.nn.Module]:
-    """
-    Best-effort discovery of "block" layers to apply fully_shard to before the root.
-    Tries common container paths, then falls back to a size-based heuristic.
-    """
-    candidates: List[torch.nn.Module] = []
-
-    # Try common attributes: model.model.layers / model.transformer.layers / model.layers / layers
-    try_paths = [
-        "model.layers",
-        "transformer.layers",
-        "backbone.layers",
-        "layers",
-    ]
-    for p in try_paths:
-        try:
-            obj = model
-            for part in p.split("."):
-                obj = getattr(obj, part)
-            # If it's an iterable/modulelist of blocks, return those
-            if isinstance(obj, (torch.nn.ModuleList, list, tuple)):
-                cs = [m for m in obj if isinstance(m, torch.nn.Module)]
-                if cs:
-                    return cs
-        except Exception:
-            pass
-
-    # Fallback: size-based heuristic for large child modules (transformer blocks)
-    for name, mod in model.named_children():
-        try:
-            nparams = sum(p.numel() for p in mod.parameters())
-            if nparams >= 5_000_000:  # heuristic threshold
-                candidates.append(mod)
-        except Exception:
-            continue
-
-    return candidates
-
-
 class ModelService:
-    def __init__(self, model, tokenizer, text_pipeline, settings):
+    def __init__(self, model, tokenizer, text_pipeline, settings, is_fsdp: bool):
         self.model = model
         self.tokenizer = tokenizer
-        self.text_pipeline = text_pipeline
+        self.text_pipeline = text_pipeline  # None when FSDP/grouped_gemm path
         self.settings = settings
+        self.is_fsdp = is_fsdp
         self.gpu_gate = GPUConcurrencyGate(max_concurrency=int(getattr(settings, "GENERATION_MAX_CONCURRENCY", 1)))
 
     @property
     def is_cohere_reasoning_model(self) -> bool:
         return self.settings.MODEL_NAME.strip().lower() == "coherelabs/command-a-reasoning-08-2025"
 
+    def _local_device(self) -> torch.device:
+        if self.is_fsdp and dist.is_initialized():
+            local_rank = int(os.getenv("LOCAL_RANK", dist.get_rank()))
+            return torch.device(f"cuda:{local_rank}")
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        return torch.device("cpu")
+
+    def generate_prompts(
+        self,
+        prompts: List[str],
+        generation_kwargs: Dict[str, Any],
+        pad_to_multiple_of: int,
+        max_length: int,
+    ) -> List[str]:
+        """
+        Direct generate path for FSDP-wrapped or pipeline-unavailable models.
+        All ranks must participate if FSDP is used (see NOTE below).
+        """
+        device = self._local_device()
+        tok = self.tokenizer
+        model = self.model
+
+        # NOTE: For proper FSDP2 inference every rank should run this forward.
+        # Current design only invokes generate on rank 0 (others idle) which can hang for FSDP2.
+        # You must adapt orchestration later; this function assumes either:
+        #   (a) FSDP1 still working with single-rank forward, or
+        #   (b) You call it on all ranks in lock-step.
+        out_texts: List[str] = []
+        for batch_start in range(0, len(prompts), self.settings.BATCH_JOB_PIPELINE_SIZE):
+            sub = prompts[batch_start: batch_start + self.settings.BATCH_JOB_PIPELINE_SIZE]
+            enc = tok(
+                sub,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                pad_to_multiple_of=pad_to_multiple_of,
+                max_length=max_length,
+            )
+            enc = {k: v.to(device) for k, v in enc.items()}
+            with torch.inference_mode():
+                gen_out = model.generate(**enc, **generation_kwargs)
+            for i, ids in enumerate(gen_out):
+                prompt_len = enc["input_ids"][i].shape[0]
+                # Use original tokenized prompt length for slicing
+                # (If model.generate returns concatenated prompt+completion)
+                completion = ids[enc["input_ids"][i].shape[0]:]
+                out_texts.append(tok.decode(completion, skip_special_tokens=True))
+        return out_texts
+
     @classmethod
     def from_settings(cls, s):
-        # Torch backend knobs
         torch.backends.cuda.matmul.allow_tf32 = True
         try:
             torch.backends.cudnn.allow_tf32 = True
         except Exception:
             pass
 
-        # Dtype selection
         dtype: Any = "auto"
         ts = s.TORCH_DTYPE.lower()
         if ts in ("bf16", "bfloat16", "torch.bfloat16"):
@@ -123,8 +113,7 @@ class ModelService:
 
         use_grouped_gemm = bool(getattr(s, "USE_GROUPED_GEMM", False))
 
-        # Load config
-        config: Optional[Any] = None
+        config = None
         try:
             config = AutoConfig.from_pretrained(
                 s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False
@@ -132,26 +121,18 @@ class ModelService:
         except Exception as e:
             logger.warning(f"Failed to load config first: {e}")
 
-        # For fused checkpoints, enable grouped_gemm kernels if config supports it
         if config and use_grouped_gemm and hasattr(config, "use_grouped_gemm"):
             try:
                 config.use_grouped_gemm = True
                 logger.info("Set config.use_grouped_gemm=True (expect fused checkpoint).")
             except Exception as e:
-                logger.warning(f"Could not set use_grouped_gemm on config: {e}")
+                logger.warning(f"Could not set use_grouped_gemm: {e}")
 
-        # Device map policy:
-        # - USE_GROUPED_GEMM: CPU-first load (device_map=None); we fully_shard (FSDP2) after load.
-        # - Otherwise: respect DEVICE_MAP (defaults to 'auto') for standard flow.
         device_map_to_use = None if use_grouped_gemm else s.DEVICE_MAP
-
         logger.info(
-            f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
-            f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{device_map_to_use}', "
-            f"use_grouped_gemm={use_grouped_gemm})"
+            f"Loading model '{s.MODEL_NAME}' (device_map={device_map_to_use}, grouped_gemm={use_grouped_gemm})"
         )
 
-        # Load model
         init_kwargs = dict(base_init)
         if device_map_to_use is not None:
             init_kwargs["device_map"] = device_map_to_use
@@ -171,7 +152,7 @@ class ModelService:
                     **init_kwargs,
                 )
         except TypeError:
-            logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+            logger.warning("Retrying load without attn_implementation.")
             if config is not None:
                 model = AutoModelForCausalLM.from_pretrained(
                     s.MODEL_NAME,
@@ -186,13 +167,8 @@ class ModelService:
             try:
                 model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
             except Exception as e:
-                logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
-                try:
-                    model.set_attention_implementation("sdpa")
-                except Exception as e2:
-                    logger.warning(f"Could not set SDPA either: {e2}")
+                logger.warning(f"Could not set attention implementation: {e}")
 
-        # Tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE, local_files_only=False
         )
@@ -200,68 +176,47 @@ class ModelService:
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        # Optional: static KV cache
-        if s.STATIC_KV_CACHE:
-            try:
-                model.generation_config.cache_implementation = "static"
-                logger.info("Enabled static KV cache.")
-            except Exception as e:
-                logger.warning(f"Static KV cache not available: {e}")
-
-        # FSDP2 fully_shard path when using grouped GEMM
+        # FSDP wrap (current FSDP v1 path). If migrating to fully_shard (FSDP2),
+        # replace this block with fully_shard calls. We mark is_fsdp True to skip pipeline.
+        is_fsdp = False
         if use_grouped_gemm:
-            try:
-                # Require PyTorch with FSDP2
-                from torch.distributed.fsdp import fully_shard  # FSDP2 API
-                # Optional mixed precision for inference could be added with MixedPrecisionPolicy if desired.
-
-                # Select device per rank
-                device = _get_local_device()
-
-                # Shard transformer blocks first, then shard the root
-                layers = _discover_transformer_layers(model)
-                if layers:
-                    for i, layer in enumerate(layers):
-                        fully_shard(layer)  # moves shards to device mesh (rank device)
-                    logger.info(f"Applied fully_shard to {len(layers)} submodules.")
-                else:
-                    logger.warning("Could not auto-discover transformer layers; applying fully_shard to root only.")
-
-                # Root wrap
-                fully_shard(model)
-                logger.info("Applied fully_shard to root model.")
-            except ImportError as e:
-                logger.error(
-                    "FSDP2 (fully_shard) is not available in this PyTorch. "
-                    "Upgrade to a version that provides torch.distributed.fsdp.fully_shard."
-                )
-                # Fallback: single-device
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                try:
+                    local_rank = int(os.getenv("LOCAL_RANK", dist.get_rank()))
+                    torch.cuda.set_device(local_rank)
+                    device = torch.device(f"cuda:{local_rank}")
+                    model.to(device)
+                    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+                    auto_wrap = size_based_auto_wrap_policy(min_num_params=5_000_000)
+                    model = FSDP(model, auto_wrap_policy=auto_wrap, device_id=device)
+                    is_fsdp = True
+                    logger.info(f"Wrapped model with FSDP on rank {dist.get_rank()}.")
+                except Exception as e:
+                    logger.error(f"FSDP setup failed; using single GPU if available: {e}")
+                    if torch.cuda.is_available():
+                        model.to("cuda:0")
+            else:
                 if torch.cuda.is_available():
                     model.to("cuda:0")
-            except Exception as e:
-                logger.error(f"FSDP2 setup failed; falling back to single-device if possible: {e}")
-                if torch.cuda.is_available():
-                    model.to("cuda:0")
+                is_fsdp = True  # treat as special path even if single-device fallback
 
         model.eval()
 
-        # Build generation pipeline.
-        # For FSDP2, pass the per-rank device so pipeline places inputs correctly.
-        if use_grouped_gemm:
-            pipe_device = _get_local_device()
-            text_pipeline = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                trust_remote_code=s.TRUST_REMOTE_CODE,
-                device=pipe_device,
-            )
+        # Try pipeline only if not FSDP path
+        text_pipe = None
+        if not is_fsdp:
+            try:
+                text_pipe = pipeline(
+                    "text-generation",
+                    model=model,
+                    tokenizer=tokenizer,
+                    trust_remote_code=s.TRUST_REMOTE_CODE,
+                )
+            except Exception as e:
+                logger.warning(f"Pipeline unavailable, will use direct generate: {e}")
+                text_pipe = None
         else:
-            text_pipeline = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                trust_remote_code=s.TRUST_REMOTE_CODE,
-            )
+            logger.info("Skipping pipeline construction (FSDP path). Using direct generate.")
 
-        return cls(model=model, tokenizer=tokenizer, text_pipeline=text_pipeline, settings=s)
+        return cls(model=model, tokenizer=tokenizer, text_pipeline=text_pipe, settings=s, is_fsdp=is_fsdp)
