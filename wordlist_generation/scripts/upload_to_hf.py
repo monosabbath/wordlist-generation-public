@@ -102,6 +102,7 @@ def main():
         api.create_repo(
             repo_id=args.repo_id,
             private=args.private,
+            repo_type="model",
             exist_ok=True,
         )
         print(f"[repo] ✓ https://huggingface.co/{args.repo_id}")
@@ -115,6 +116,7 @@ def main():
         print("[upload] This is resumable - you can Ctrl+C and restart")
         api.upload_large_folder(
             repo_id=args.repo_id,
+            repo_type="model",  # REQUIRED for upload_large_folder
             folder_path=str(folder),
             num_workers=args.num_workers,
         )
