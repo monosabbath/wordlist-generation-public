@@ -1,10 +1,4 @@
-import os
-import time
-import logging
 from contextlib import asynccontextmanager
-
-import torch
-import torch.distributed as dist
 from fastapi import FastAPI
 
 from wordlist_generation.config.settings import Settings
@@ -15,42 +9,13 @@ from wordlist_generation.api.routers import chat, batch
 from wordlist_generation.inference.vocab_constraints.prefix import build_regexp_prefix_fn
 
 
-def init_dist_if_needed(settings: Settings, backend: str = "nccl"):
-    """
-    Initialize torch.distributed if:
-      - USE_GROUPED_GEMM is true, and
-      - Distributed env vars (RANK/WORLD_SIZE) are present, and
-      - Not already initialized.
-    """
-    if not getattr(settings, "USE_GROUPED_GEMM", False):
-        return
-    if dist.is_initialized():
-        return
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend=backend)
-        local_rank = int(os.getenv("LOCAL_RANK", 0))
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-        logger = logging.getLogger("dist")
-        logger.info(
-            f"Initialized process group: rank={dist.get_rank()} "
-            f"world_size={dist.get_world_size()} local_rank={local_rank}"
-        )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Load settings and logging
     settings = Settings()
     configure_logging(settings)
 
-    # Initialize distributed (no-op unless properly launched with torchrun)
-    try:
-        init_dist_if_needed(settings, backend="nccl")
-    except Exception as e:
-        logging.getLogger("dist").warning(f"Distributed init skipped/failed: {e}")
-
-    # Initialize model service (loads model/tokenizer/pipeline; applies FSDP2 when enabled)
+    # Initialize model service (loads model/tokenizer/pipeline)
     model_service = ModelService.from_settings(settings)
 
     # Initialize batch processor service
@@ -63,7 +28,9 @@ async def lifespan(app: FastAPI):
 
     # Optional: prebuild regex prefix functions for constrained vocab
     if settings.PREBUILD_PREFIX and settings.PREBUILD_LANGS:
-        logger = logging.getLogger("prebuild")
+        from logging import getLogger
+
+        logger = getLogger("prebuild")
         logger.info("Prebuilding prefix functions...")
         for lang in settings.PREBUILD_LANGS:
             for n in settings.PREBUILD_WORD_COUNTS:
@@ -91,34 +58,3 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
-
-
-if __name__ == "__main__":
-    # Integrated runner to support multi-GPU via FSDP2 inside the main app.
-    # Launch with:
-    #   torchrun --nproc_per_node=<GPUS> -m wordlist_generation.app.main --host 0.0.0.0 --port 8000
-    import argparse
-    import uvicorn
-
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--backend", default="nccl")
-    args = ap.parse_args()
-
-    settings = Settings()
-    configure_logging(settings)
-
-    # Initialize distributed if needed
-    try:
-        init_dist_if_needed(settings, backend=args.backend)
-    except Exception as e:
-        logging.getLogger("dist").warning(f"Distributed init skipped/failed: {e}")
-
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    if rank == 0:
-        uvicorn.run(app, host=args.host, port=args.port)
-    else:
-        # Keep nonzero ranks alive to back FSDP; rank 0 hosts the API
-        while True:
-            time.sleep(60)
