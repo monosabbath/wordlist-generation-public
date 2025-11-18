@@ -31,9 +31,14 @@ class Settings:
         os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512")
     )
     STATIC_KV_CACHE: bool = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
-    
-    # Grouped GEMM (for fused checkpoints)
+
+    # Grouped GEMM / MoE optimization flags
+    # USE_GROUPED_GEMM: enable optimization and expose fuse_experts() flow
+    # LOAD_FUSED_EXPERTS: checkpoint already saved after fuse_experts()
+    # FUSE_ON_CPU_BEFORE_SHARD: force CPU load then fuse, then shard to GPUs
     USE_GROUPED_GEMM: bool = os.getenv("USE_GROUPED_GEMM", "false").lower() == "true"
+    LOAD_FUSED_EXPERTS: bool = os.getenv("LOAD_FUSED_EXPERTS", "false").lower() == "true"
+    FUSE_ON_CPU_BEFORE_SHARD: bool = os.getenv("FUSE_ON_CPU_BEFORE_SHARD", "false").lower() == "true"
 
     # Constrained vocab
     PREBUILD_PREFIX: bool = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
