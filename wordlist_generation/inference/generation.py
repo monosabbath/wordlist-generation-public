@@ -2,27 +2,38 @@ from typing import Any, Dict, Optional
 import torch
 
 
-def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
+def _model_primary_device(model) -> torch.device:
     """
-    Fix: For multi-GPU sharded models (hf_device_map with >1 devices) leave inputs on CPU.
-    Accelerate dispatch expects CPU inputs and will scatter them efficiently.
-    Only move inputs if the model resides wholly on a single device.
+    Best-effort way to pick the correct "entry" device for inputs.
+    - Prefer input embedding weight device if available
+    - Else first parameter device
+    - Else CUDA:0 if available; else CPU
     """
     try:
-        device_map = getattr(model, "hf_device_map", None)
-        if isinstance(device_map, dict):
-            unique_devices = {str(v) for v in device_map.values()}
-            if len(unique_devices) > 1:
-                return inputs  # multi-device: keep on CPU
-            # Single-device map
-            sole = list(unique_devices)[0]
-            dev = torch.device(sole) if ("cuda" in sole or "cpu" in sole) else next(model.parameters()).device
-            return {k: v.to(dev) for k, v in inputs.items()}
-        # Fallback: model.parameters() device
-        device = next(model.parameters()).device
-        return {k: v.to(device) for k, v in inputs.items()}
+        emb = getattr(model, "get_input_embeddings", None)
+        if callable(emb):
+            emb_mod = emb()
+            if emb_mod is not None:
+                p = next(emb_mod.parameters(), None)
+                if p is not None:
+                    return p.device
     except Exception:
-        return inputs
+        pass
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
+    device = _model_primary_device(model)
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in inputs.items():
+        if isinstance(v, torch.Tensor):
+            out[k] = v.to(device, non_blocking=True)
+        else:
+            out[k] = v
+    return out
 
 
 def tokenizer_encode_for_chat(tokenizer, texts: Any, pad_to_multiple_of: int, max_input_tokens: int) -> Dict[str, torch.Tensor]:
@@ -44,10 +55,12 @@ def strip_unused_model_inputs(inputs: Dict[str, torch.Tensor]) -> Dict[str, torc
 
 
 def normalize_max_new_tokens(requested: Optional[int], allowed: Optional[tuple[int, ...]]) -> int:
+    # Use the configured allowed set to determine the cap; fall back to 512 if not provided.
     if not allowed or len(allowed) == 0:
         cap = 512
         target = int(requested) if requested is not None else cap
         return min(target, cap)
+    # allowed is sorted in Settings; use its max as cap
     cap = allowed[-1]
     target = int(requested) if requested is not None else cap
     target = min(target, cap)
@@ -61,12 +74,14 @@ def truncate_inputs_to_max_length(inputs: Dict[str, torch.Tensor], max_length: i
     input_ids = inputs["input_ids"]
     attn = inputs.get("attention_mask")
     if input_ids.dim() == 1:
-        if input_ids.size(0) > max_length:
+        length = input_ids.size(0)
+        if length > max_length:
             input_ids = input_ids[-max_length:]
             if attn is not None:
                 attn = attn[-max_length:]
     elif input_ids.dim() == 2:
-        if input_ids.size(1) > max_length:
+        bsz, seqlen = input_ids.size()
+        if seqlen > max_length:
             input_ids = input_ids[:, -max_length:]
             if attn is not None:
                 attn = attn[:, -max_length:]
@@ -86,11 +101,13 @@ def getgen_kwargs(
     num_beams: Optional[int] = None,
     length_penalty: float = 1.0,
     prefix_fn=None,
+    # Sampling parameters
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repetition_penalty: Optional[float] = None,
 ):
+    # Defaults for sampling params when not provided
     t = float(temperature if temperature is not None else 1.0)
     tp = float(top_p if top_p is not None else 1.0)
     tk = int(top_k if top_k is not None else 50)
@@ -98,6 +115,7 @@ def getgen_kwargs(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
+        # Enable sampling together with beam search
         do_sample=True,
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
