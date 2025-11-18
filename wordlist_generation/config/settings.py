@@ -3,7 +3,6 @@ import tempfile
 from typing import List, Tuple
 from dotenv import load_dotenv
 
-# Load .env early
 load_dotenv()
 
 
@@ -25,22 +24,17 @@ class Settings:
     TOKENIZER_PADDING_SIDE: str = os.getenv("TOKENIZER_PADDING_SIDE", "left").strip()
     PAD_TO_MULTIPLE_OF: int = int(os.getenv("PAD_TO_MULTIPLE_OF", "64"))
     MAX_INPUT_TOKENS: int = int(os.getenv("MAX_INPUT_TOKENS", "512"))
-    ALLOWED_MAX_NEW_TOKENS: Tuple[int, ...] = _parse_int_tuple(
-        os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512")
-    )
+    ALLOWED_MAX_NEW_TOKENS: Tuple[int, ...] = _parse_int_tuple(os.getenv("ALLOWED_MAX_NEW_TOKENS", "64,128,256,512"))
     STATIC_KV_CACHE: bool = os.getenv("STATIC_KV_CACHE", "false").lower() == "true"
 
     GENERATION_MAX_CONCURRENCY: int = int(os.getenv("GENERATION_MAX_CONCURRENCY", "1"))
 
-    # Grouped GEMM / MoE optimization switch:
-    # - True: expect an offline fused checkpoint; CPU-first load; FSDP2 shards across GPUs if launched with torchrun.
-    # - False: standard device_map path (e.g., 'auto'); no grouped_gemm or FSDP2.
+    # When true: assumes fused checkpoint; CPU-first load + Accelerate dispatch (model-parallel).
+    # When false: direct device_map path (often 'auto').
     USE_GROUPED_GEMM: bool = os.getenv("USE_GROUPED_GEMM", "false").lower() == "true"
 
     PREBUILD_PREFIX: bool = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
-    PREBUILD_WORD_COUNTS: Tuple[int, ...] = tuple(
-        int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
-    )
+    PREBUILD_WORD_COUNTS: Tuple[int, ...] = tuple(int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(","))
     PREBUILD_LANGS: List[str] = [x.strip() for x in os.getenv("PREBUILD_LANGS", "").split(",") if x.strip()]
     WORDLIST_DIR: str = os.getenv("WORDLIST_DIR", "wordlists")
 
