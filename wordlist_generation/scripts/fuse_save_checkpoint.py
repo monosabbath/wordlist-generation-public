@@ -3,15 +3,15 @@ Offline fusion script:
 - Loads an unfused checkpoint entirely on CPU.
 - Calls fuse_experts() (requires grouped_gemm + feature branch of Transformers).
 - Saves a new fused checkpoint directory with config.use_grouped_gemm=True.
+
 Usage:
     python wordlist_generation/scripts/fuse_save_checkpoint.py \
         --model TheDrummer/Cydonia-24B-v4.2.0 \
         --out_dir fused-cydonia-24b
+
 Then set in .env:
     MODEL_NAME=fused-cydonia-24b
     USE_GROUPED_GEMM=true
-    LOAD_FUSED_EXPERTS=true
-    FUSE_ON_CPU_BEFORE_SHARD=false
 """
 import argparse
 import os
