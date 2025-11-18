@@ -1,5 +1,7 @@
 from typing import Optional
 from fastapi import HTTPException, Header, Query, Request
+from wordlist_generation.services.generation_service import GenerationService
+from wordlist_generation.services.batch_service import BatchService
 
 
 def verify_token(
@@ -16,3 +18,11 @@ def verify_token(
     if settings.SECRET_TOKEN and supplied != settings.SECRET_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
     return True
+
+
+def get_generation_service(request: Request) -> GenerationService:
+    return request.app.state.generation_service
+
+
+def get_batch_service(request: Request) -> BatchService:
+    return request.app.state.batch_service

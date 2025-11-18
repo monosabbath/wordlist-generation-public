@@ -21,3 +21,4 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = 1.0
     top_k: Optional[int] = 50
     repetition_penalty: Optional[float] = 1.0
+

@@ -4,7 +4,8 @@ from fastapi import FastAPI
 from wordlist_generation.config.settings import Settings
 from wordlist_generation.config.logging import configure_logging
 from wordlist_generation.services.model_service import ModelService
-from wordlist_generation.services.batch_processor import BatchProcessor
+from wordlist_generation.services.generation_service import GenerationService
+from wordlist_generation.services.batch_service import BatchService
 from wordlist_generation.api.routers import chat, batch
 from wordlist_generation.inference.vocab_constraints.prefix import build_regexp_prefix_fn
 
@@ -17,14 +18,18 @@ async def lifespan(app: FastAPI):
 
     # Initialize model service (loads model/tokenizer/pipeline)
     model_service = ModelService.from_settings(settings)
+    
+    # Initialize generation service
+    generation_service = GenerationService(model_service=model_service, settings=settings)
 
     # Initialize batch processor service
-    batch_processor = BatchProcessor(settings=settings, model_service=model_service)
+    batch_service = BatchService(settings=settings, generation_service=generation_service)
 
-    # Store on app.state
+    # Store on app.state for dependency injection
     app.state.settings = settings
     app.state.model_service = model_service
-    app.state.batch_processor = batch_processor
+    app.state.generation_service = generation_service
+    app.state.batch_service = batch_service
 
     # Optional: prebuild regex prefix functions for constrained vocab
     if settings.PREBUILD_PREFIX and settings.PREBUILD_LANGS:

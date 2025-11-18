@@ -1,16 +1,17 @@
 from fastapi import APIRouter, Depends, File, UploadFile, BackgroundTasks, HTTPException, Request
 from fastapi.responses import FileResponse
 
-from wordlist_generation.api.dependencies import verify_token
+from wordlist_generation.api.dependencies import verify_token, get_batch_service
+from wordlist_generation.services.batch_service import BatchService
 
 router = APIRouter(prefix="/v1/batch", tags=["batch"])
 
 
 @router.post("/jobs")
 def create_batch_job(
-    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
+    service: BatchService = Depends(get_batch_service),
     auth_ok: bool = Depends(verify_token),
     max_tokens: int = 512,
     num_beams: int = 5,
@@ -23,8 +24,7 @@ def create_batch_job(
     top_k: int = 50,
     repetition_penalty: float = 1.0,
 ):
-    bp = request.app.state.batch_processor
-    return bp.enqueue(
+    return service.enqueue(
         background_tasks=background_tasks,
         file=file,
         max_tokens=max_tokens,
@@ -40,9 +40,12 @@ def create_batch_job(
 
 
 @router.get("/jobs/{job_id}")
-def get_batch_job_status(job_id: str, request: Request, auth_ok: bool = Depends(verify_token)):
-    bp = request.app.state.batch_processor
-    job = bp.job_status.get(job_id)
+def get_batch_job_status(
+    job_id: str, 
+    service: BatchService = Depends(get_batch_service),
+    auth_ok: bool = Depends(verify_token)
+):
+    job = service.job_status.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return {
@@ -54,9 +57,12 @@ def get_batch_job_status(job_id: str, request: Request, auth_ok: bool = Depends(
 
 
 @router.get("/jobs/{job_id}/results")
-def get_batch_job_results(job_id: str, request: Request, auth_ok: bool = Depends(verify_token)):
-    bp = request.app.state.batch_processor
-    job = bp.job_status.get(job_id)
+def get_batch_job_results(
+    job_id: str, 
+    service: BatchService = Depends(get_batch_service),
+    auth_ok: bool = Depends(verify_token)
+):
+    job = service.job_status.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if job["status"] == "completed":
