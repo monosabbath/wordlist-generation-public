@@ -1,14 +1,35 @@
 from typing import Any, Dict, Optional
+import os
 import torch
+
+
+def _local_rank_device() -> Optional[torch.device]:
+    try:
+        if torch.cuda.is_available():
+            lr = os.getenv("LOCAL_RANK")
+            if lr is not None and lr.isdigit():
+                return torch.device(f"cuda:{int(lr)}")
+            # fallback to current
+            return torch.device(torch.cuda.current_device())
+    except Exception:
+        pass
+    return None
 
 
 def _model_primary_device(model) -> torch.device:
     """
     Best-effort way to pick the correct "entry" device for inputs.
-    - Prefer input embedding weight device if available
+    FSDP2 note: prefer LOCAL_RANK cuda device when available.
+    - Prefer LOCAL_RANK CUDA device if present (FSDP2 multi-process).
+    - Else input embedding weight device if available
     - Else first parameter device
     - Else CUDA:0 if available; else CPU
     """
+    # Prefer local-rank device when running under torchrun (FSDP2)
+    lr_dev = _local_rank_device()
+    if lr_dev is not None:
+        return lr_dev
+
     try:
         emb = getattr(model, "get_input_embeddings", None)
         if callable(emb):
