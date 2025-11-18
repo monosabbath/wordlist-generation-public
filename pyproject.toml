@@ -1,6 +1,6 @@
 [project]
 name = "wordlist-generation"
-version = "0.2.4"
+version = "0.2.3"
 description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
@@ -15,16 +15,14 @@ dependencies = [
     "safetensors",
     "torch",
     "python-multipart",
-    # Pin to feature branch providing grouped_gemm integration (DeepseekV3 MoE optimization)
-    "transformers @ git+https://github.com/bzantium/transformers@feature/%2340582",
+    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "transformers>=4.46.2,<5.0.0",
     "tokenizers>=0.20.1",
     # Tokenizers/libs commonly used by models
     "tiktoken",
     "sentencepiece",
     # Server
     "uvicorn>=0.30.0",
-    # Grouped GEMM optimization
-    "nv-grouped-gemm @ git+https://github.com/fanshiqing/grouped_gemm@main",
 ]
 
 [dependency-groups]
