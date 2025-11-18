@@ -37,10 +37,6 @@ class Settings:
     FUSE_ON_CPU_BEFORE_SHARD: bool = os.getenv("FUSE_ON_CPU_BEFORE_SHARD", "false").lower() == "true"
     CPU_FIRST_LOAD: bool = os.getenv("CPU_FIRST_LOAD", "false").lower() == "true"
 
-    # Max memory mapping env: "cuda:0=40GiB,cuda:1=40GiB,cpu=64GiB"
-    MAX_MEMORY: str = os.getenv("MAX_MEMORY", "").strip()
-    NO_SPLIT_MODULE_CLASSES: str = os.getenv("NO_SPLIT_MODULE_CLASSES", "").strip()
-
     PREBUILD_PREFIX: bool = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
     PREBUILD_WORD_COUNTS: Tuple[int, ...] = tuple(
         int(x) for x in os.getenv("PREBUILD_WORD_COUNTS", "3000").split(",")
