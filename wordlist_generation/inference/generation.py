@@ -4,27 +4,21 @@ import torch
 
 def move_inputs_to_correct_device(inputs: Dict[str, torch.Tensor], model):
     """
-    Safe device handling:
-
-    - If the model is sharded across >1 devices (multi-GPU with hf_device_map), leave inputs on CPU.
-      Accelerate's dispatch_model expects CPU (or neutral) inputs and will route them efficiently.
-      Forcing them onto a single GPU can trigger implicit full-weight or buffer copies -> OOM.
-
-    - If the model is on exactly one device, move inputs there.
+    Fix: For multi-GPU sharded models (hf_device_map with >1 devices) leave inputs on CPU.
+    Accelerate dispatch expects CPU inputs and will scatter them efficiently.
+    Only move inputs if the model resides wholly on a single device.
     """
     try:
         device_map = getattr(model, "hf_device_map", None)
         if isinstance(device_map, dict):
             unique_devices = {str(v) for v in device_map.values()}
-            # Multi-device: keep on CPU
             if len(unique_devices) > 1:
-                return inputs  # no move
-            # Single-device sharded map case (rare but possible)
+                return inputs  # multi-device: keep on CPU
+            # Single-device map
             sole = list(unique_devices)[0]
-            if "cuda" in sole or "cpu" in sole:
-                dev = torch.device(sole)
-                return {k: v.to(dev) for k, v in inputs.items()}
-        # Fallback: model has parameters on a single device
+            dev = torch.device(sole) if ("cuda" in sole or "cpu" in sole) else next(model.parameters()).device
+            return {k: v.to(dev) for k, v in inputs.items()}
+        # Fallback: model.parameters() device
         device = next(model.parameters()).device
         return {k: v.to(device) for k, v in inputs.items()}
     except Exception:
@@ -104,7 +98,7 @@ def getgen_kwargs(
 
     gen_kwargs = dict(
         max_new_tokens=int(max_new_tokens),
-        do_sample=True,  # (Leave as-is; you asked not to change beam search config)
+        do_sample=True,
         num_beams=int(num_beams or 10),
         length_penalty=float(length_penalty),
         temperature=t,
