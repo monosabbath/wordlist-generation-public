@@ -32,10 +32,10 @@ class Settings:
 
     GENERATION_MAX_CONCURRENCY: int = int(os.getenv("GENERATION_MAX_CONCURRENCY", "1"))
 
+    # Grouped GEMM / MoE optimization switch:
+    # - True: expect an offline fused checkpoint; CPU-first load; FSDP2 shards across GPUs if launched with torchrun.
+    # - False: standard device_map path (e.g., 'auto'); no grouped_gemm or FSDP2.
     USE_GROUPED_GEMM: bool = os.getenv("USE_GROUPED_GEMM", "false").lower() == "true"
-    LOAD_FUSED_EXPERTS: bool = os.getenv("LOAD_FUSED_EXPERTS", "false").lower() == "true"
-    FUSE_ON_CPU_BEFORE_SHARD: bool = os.getenv("FUSE_ON_CPU_BEFORE_SHARD", "false").lower() == "true"
-    CPU_FIRST_LOAD: bool = os.getenv("CPU_FIRST_LOAD", "false").lower() == "true"
 
     PREBUILD_PREFIX: bool = os.getenv("PREBUILD_PREFIX", "true").lower() == "true"
     PREBUILD_WORD_COUNTS: Tuple[int, ...] = tuple(
