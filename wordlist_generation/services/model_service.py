@@ -1,8 +1,25 @@
 import logging
 from typing import Any, Dict
+import os
+import sys
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig, BitsAndBytesConfig
+
+# Try to import qwen3_moe_fused
+try:
+    POSSIBLE_PATHS = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../transformers-qwen3-moe-fused")),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../transformers-qwen3-moe-fused")),
+    ]
+    for p in POSSIBLE_PATHS:
+        if os.path.exists(p) and p not in sys.path:
+            sys.path.append(p)
+    from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
+    from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
+    HAS_FUSED_MOE = True
+except ImportError:
+    HAS_FUSED_MOE = False
 
 logger = logging.getLogger("model-service")
 
@@ -58,6 +75,30 @@ class ModelService:
         else:
             logger.info("Using dtype: auto")
 
+        # Determine if we should use Qwen3 Fused MoE
+        use_fused_class = False
+        if HAS_FUSED_MOE:
+            try:
+                config = AutoConfig.from_pretrained(s.MODEL_NAME, trust_remote_code=s.TRUST_REMOTE_CODE)
+                if hasattr(config, "architectures") and config.architectures and "Qwen3MoeFused" in config.architectures[0]:
+                    use_fused_class = True
+                    logger.info("Detected Qwen3FusedMoe architecture.")
+            except Exception as e:
+                logger.warning(f"Could not inspect config for fused architecture: {e}")
+
+        # Quantization config
+        quantization_config = None
+        if getattr(s, "LOAD_IN_4BIT", False):
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=dtype if dtype != "auto" else torch.bfloat16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            logger.info("Enabled 4-bit quantization (load_in_4bit=True).")
+            if use_fused_class:
+                patch_bnb_quantizer()
+
         init_kwargs: Dict[str, Any] = {
             "trust_remote_code": s.TRUST_REMOTE_CODE,
             "low_cpu_mem_usage": True,
@@ -66,32 +107,49 @@ class ModelService:
         }
         if dtype != "auto":
             init_kwargs["torch_dtype"] = dtype
+        
+        if quantization_config:
+            init_kwargs["quantization_config"] = quantization_config
 
         logger.info(
             f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
             f"attn='{s.ATTN_IMPLEMENTATION}', device_map='{s.DEVICE_MAP}')"
         )
 
-        try:
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                attn_implementation=s.ATTN_IMPLEMENTATION,
-                **init_kwargs,
-            )
-        except TypeError:
-            logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
-            model = AutoModelForCausalLM.from_pretrained(
-                s.MODEL_NAME,
-                **init_kwargs,
-            )
+        model = None
+        if use_fused_class:
+            logger.info("Using Qwen3MoeFusedForCausalLM for loading.")
             try:
-                model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
+                model = Qwen3MoeFusedForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    **init_kwargs,
+                )
             except Exception as e:
-                logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
+                logger.error(f"Failed to load with Qwen3MoeFusedForCausalLM: {e}")
+                # Fallback might fail if architecture is unknown to AutoModel, but we can try
+        
+        if model is None:
+            try:
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    attn_implementation=s.ATTN_IMPLEMENTATION,
+                    **init_kwargs,
+                )
+            except TypeError:
+                logger.warning("Model.from_pretrained() did not accept attn_implementation; retrying without it.")
+                model = AutoModelForCausalLM.from_pretrained(
+                    s.MODEL_NAME,
+                    **init_kwargs,
+                )
                 try:
-                    model.set_attention_implementation("sdpa")
-                except Exception as e2:
-                    logger.warning(f"Could not set SDPA either: {e2}")
+                    model.set_attention_implementation(s.ATTN_IMPLEMENTATION)
+                except Exception as e:
+                    logger.warning(f"Could not set attention implementation: {e}. Falling back to SDPA if possible.")
+                    try:
+                        model.set_attention_implementation("sdpa")
+                    except Exception as e2:
+                        logger.warning(f"Could not set SDPA either: {e2}")
 
         if s.STATIC_KV_CACHE:
             try:

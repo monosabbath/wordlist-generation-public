@@ -42,6 +42,7 @@ class Settings:
 
     # Torch dtype
     TORCH_DTYPE: str = os.getenv("TORCH_DTYPE", "auto")
+    LOAD_IN_4BIT: bool = os.getenv("LOAD_IN_4BIT", "false").lower() == "true"
 
     # Batch jobs
     BATCH_JOB_TEMP_DIR: str = os.getenv("BATCH_JOB_TEMP_DIR", tempfile.gettempdir())
