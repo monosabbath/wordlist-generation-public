@@ -3,31 +3,31 @@ name = "wordlist-generation"
 version = "0.2.3"
 description = "Vocabulary-constrained generation server (FastAPI + Transformers + lm-format-enforcer)"
 readme = "README.md"
-requires-python = "==3.12.*"
+requires-python = ">=3.11, <3.13"
 
 dependencies = [
-    "accelerate==1.0.0",
-    "fastapi==0.115.0",
-    "httpx==0.27.2",
-    "lm-format-enforcer==0.11.2",
-    "pydantic==2.9.2",
-    "python-dotenv==1.0.1",
-    "safetensors==0.4.5",
-    "torch==2.9.1",
-    "python-multipart==0.0.12",
-    "bitsandbytes==0.45.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "transformers==4.50.0",
-    "tokenizers==0.21.0",
+    "accelerate>=0.32.0",
+    "fastapi",
+    "httpx",
+    "lm-format-enforcer>=0.11.2",
+    "pydantic>=2",
+    "python-dotenv",
+    "safetensors",
+    "torch",
+    "python-multipart",
+    "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "transformers>=4.46.2,<5.0.0",
+    "tokenizers>=0.20.1",
     # Tokenizers/libs commonly used by models
-    "tiktoken==0.8.0",
-    "sentencepiece==0.2.0",
+    "tiktoken",
+    "sentencepiece",
     # Server
-    "uvicorn==0.32.0",
+    "uvicorn>=0.30.0",
 ]
 
 [dependency-groups]
 dev = [
-    "ruff==0.6.9",
+    "ruff",
 ]
 
 [tool.setuptools.packages.find]
