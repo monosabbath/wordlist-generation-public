@@ -29,12 +29,18 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Path to save the quantized model.")
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    input_path = args.input_dir
+    # Check if input is a local directory or a repo ID
+    if os.path.isdir(input_path):
+        input_dir = Path(input_path).resolve()
+        print(f"Using local input directory: {input_dir}")
+    else:
+        # Assuming it's a repo ID, let transformers handle the download/cache path resolution naturally
+        # unless we need the explicit path for some reason. Qwen3MoeFusedForCausalLM.from_pretrained works with repo IDs.
+        input_dir = input_path
+        print(f"Using HF Repo ID: {input_dir}")
 
-    if not input_dir.exists():
-        print(f"[ERROR] Input directory does not exist: {input_dir}")
-        sys.exit(1)
+    output_dir = Path(args.output_dir).resolve()
 
     print(f"Loading fused model from {input_dir} with 4-bit quantization...")
     print("NOTE: This requires a GPU with enough VRAM to load the model!")

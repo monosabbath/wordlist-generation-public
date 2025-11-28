@@ -3,6 +3,10 @@ import argparse
 import sys
 import os
 from pathlib import Path
+from dotenv import load_dotenv, find_dotenv
+
+# Load env vars for HF_TOKEN if available
+load_dotenv(find_dotenv(usecwd=True))
 
 # Try to import qwen3_moe_fused
 # Assuming it's in a sibling directory or installed
@@ -27,12 +31,27 @@ def main():
     parser.add_argument("--output_dir", required=True, help="Path to save the fused model.")
     args = parser.parse_args()
 
-    input_dir = Path(args.input_dir).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    input_path = args.input_dir
+    # Check if input is a local directory or a repo ID
+    if os.path.isdir(input_path):
+        input_dir = Path(input_path).resolve()
+        print(f"Using local input directory: {input_dir}")
+    else:
+        # Try to download from HF
+        print(f"Input '{input_path}' is not a local directory. Attempting to download from HF Hub...")
+        token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        if token:
+            print("Using HF token from environment.")
+        
+        try:
+            from huggingface_hub import snapshot_download
+            input_dir = Path(snapshot_download(repo_id=input_path, token=token)).resolve()
+            print(f"Model downloaded to: {input_dir}")
+        except Exception as e:
+            print(f"[ERROR] Failed to download model '{input_path}': {e}")
+            sys.exit(1)
 
-    if not input_dir.exists():
-        print(f"[ERROR] Input directory does not exist: {input_dir}")
-        sys.exit(1)
+    output_dir = Path(args.output_dir).resolve()
 
     print(f"Fusing model from {input_dir} to {output_dir}...")
     convert_model_to_fused(input_dir, output_dir)
