@@ -8,10 +8,30 @@ wheels/
 
 # Virtual environments
 .venv
+venv/
+ENV/
+env/
 
 # Lockfiles
 uv.lock
 
+# Environment Variables (CRITICAL: Do not commit secrets)
+.env
+.env.*
+!.env.example
+!.env.template
+
+# IDE/Editor settings
+.idea/
+.vscode/
+*.swp
+*.swo
+
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Testing/Coverage
+.coverage
+htmlcov/
+.pytest_cache/
