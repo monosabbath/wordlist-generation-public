@@ -29,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description="Fuse Qwen3 MoE experts for faster inference.")
     parser.add_argument("--input_dir", required=True, help="Path to the input model directory (HF format).")
     parser.add_argument("--output_dir", required=True, help="Path to save the fused model.")
+    parser.add_argument("--cache_dir", help="Optional path to cache downloaded models (e.g. /tmp for container disk).")
     args = parser.parse_args()
 
     input_path = args.input_dir
@@ -40,12 +41,19 @@ def main():
         # Try to download from HF
         print(f"Input '{input_path}' is not a local directory. Attempting to download from HF Hub...")
         token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        if token:
-            print("Using HF token from environment.")
         
         try:
             from huggingface_hub import snapshot_download
-            input_dir = Path(snapshot_download(repo_id=input_path, token=token)).resolve()
+            
+            download_kwargs = {
+                "repo_id": input_path,
+                "token": token,
+                "cache_dir": args.cache_dir,
+            }
+            
+            print(f"Downloading model '{input_path}' from HF Hub...")
+            
+            input_dir = Path(snapshot_download(**download_kwargs)).resolve()
             print(f"Model downloaded to: {input_dir}")
         except Exception as e:
             print(f"[ERROR] Failed to download model '{input_path}': {e}")
