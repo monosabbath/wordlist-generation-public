@@ -3,8 +3,10 @@ from typing import Any, Dict
 import os
 import sys
 
+os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
+
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
 
 # Try to import qwen3_moe_fused
 try:
@@ -86,18 +88,9 @@ class ModelService:
             except Exception as e:
                 logger.warning(f"Could not inspect config for fused architecture: {e}")
 
-        # Quantization config
-        quantization_config = None
-        if getattr(s, "LOAD_IN_4BIT", False):
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=dtype if dtype != "auto" else torch.bfloat16,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_use_double_quant=True,
-            )
-            logger.info("Enabled 4-bit quantization (load_in_4bit=True).")
-            if use_fused_class:
-                patch_bnb_quantizer()
+        # Patch bnb quantizer for fused models (needed for pre-quantized checkpoints)
+        if use_fused_class:
+            patch_bnb_quantizer()
 
         init_kwargs: Dict[str, Any] = {
             "trust_remote_code": s.TRUST_REMOTE_CODE,
@@ -107,9 +100,6 @@ class ModelService:
         }
         if dtype != "auto":
             init_kwargs["torch_dtype"] = dtype
-        
-        if quantization_config:
-            init_kwargs["quantization_config"] = quantization_config
 
         logger.info(
             f"Loading model '{s.MODEL_NAME}' (trust_remote_code={s.TRUST_REMOTE_CODE}, "
