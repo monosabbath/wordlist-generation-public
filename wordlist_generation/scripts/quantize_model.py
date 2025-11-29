@@ -69,16 +69,23 @@ def main():
     print(f"Saving quantized model to {output_dir}...")
     model.save_pretrained(output_dir)
     
-    # Also copy tokenizer
-    from transformers import AutoTokenizer
+    # Also copy tokenizer and generation config
+    from transformers import AutoTokenizer, GenerationConfig
     try:
         tokenizer = AutoTokenizer.from_pretrained(input_dir, trust_remote_code=True)
         tokenizer.save_pretrained(output_dir)
+        print("Tokenizer saved.")
     except Exception as e:
         print(f"[WARN] Could not save tokenizer: {e}")
+
+    try:
+        gen_config = GenerationConfig.from_pretrained(input_dir, trust_remote_code=True)
+        gen_config.save_pretrained(output_dir)
+        print("Generation config saved.")
+    except Exception as e:
+        print(f"[WARN] Could not save generation config: {e}")
 
     print("Done! You can now upload the output directory.")
 
 if __name__ == "__main__":
     main()
-
