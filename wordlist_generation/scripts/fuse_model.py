@@ -63,8 +63,32 @@ def main():
 
     print(f"Fusing model from {input_dir} to {output_dir}...")
     convert_model_to_fused(input_dir, output_dir)
+    
+    # Copy tokenizer and generation config
+    print(f"Copying tokenizer and generation config to {output_dir}...")
+    try:
+        from transformers import AutoTokenizer, GenerationConfig
+        
+        # Tokenizer
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(input_dir, trust_remote_code=True)
+            tokenizer.save_pretrained(output_dir)
+            print("Tokenizer saved.")
+        except Exception as e:
+            print(f"[WARN] Failed to save tokenizer: {e}")
+
+        # Generation Config
+        try:
+            gen_config = GenerationConfig.from_pretrained(input_dir, trust_remote_code=True)
+            gen_config.save_pretrained(output_dir)
+            print("Generation config saved.")
+        except Exception as e:
+            print(f"[WARN] Failed to save generation config: {e}")
+            
+    except ImportError:
+         print("[WARN] Transformers not installed or could not import AutoTokenizer/GenerationConfig. Skipping auxiliary file copy.")
+
     print("Done! You can now upload the output directory using upload_to_hf.py.")
 
 if __name__ == "__main__":
     main()
-
