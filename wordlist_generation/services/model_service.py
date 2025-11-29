@@ -1,22 +1,12 @@
 import logging
 from typing import Any, Dict
-import os
-import sys
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig, BitsAndBytesConfig
 
-# Try to import qwen3_moe_fused
+# Try to import qwen3_moe_fused (bundled in this package)
 try:
-    POSSIBLE_PATHS = [
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../transformers-qwen3-moe-fused")),
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "../../transformers-qwen3-moe-fused")),
-    ]
-    for p in POSSIBLE_PATHS:
-        if os.path.exists(p) and p not in sys.path:
-            sys.path.append(p)
-    from qwen3_moe_fused.modular_qwen3_moe_fused import Qwen3MoeFusedForCausalLM
-    from qwen3_moe_fused.quantize.quantizer import patch_bnb_quantizer
+    from wordlist_generation.qwen3_moe_fused import Qwen3MoeFusedForCausalLM, patch_bnb_quantizer
     HAS_FUSED_MOE = True
 except ImportError:
     HAS_FUSED_MOE = False
