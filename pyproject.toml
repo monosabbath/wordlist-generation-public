@@ -16,8 +16,10 @@ dependencies = [
     "torch>=2.8.0",
     "python-multipart",
     "bitsandbytes>=0.43.1; platform_system == 'Linux' and platform_machine == 'x86_64'",
-    "transformers>=4.46.2,<5.0.0",
+    "transformers>=4.46.2,<4.57",
     "tokenizers>=0.20.1",
+    # Triton for fused MoE kernels (Linux only)
+    "triton>=3.0.0; platform_system == 'Linux'",
     # Tokenizers/libs commonly used by models
     "tiktoken",
     "sentencepiece",
